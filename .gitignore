@@ -1,0 +1,20 @@
+# Виртуальное окружение — создаётся install.bat из wheels/, в репозитории не хранится.
+.venv/
+venv/
+
+# Доступ к Confluence: реальные учётные данные. В репозитории только .env.example.
+.env
+
+# Байт-код Python.
+__pycache__/
+*.py[cod]
+
+# Результаты выгрузки: требования сервисов, у них свой репозиторий (Doc as Code).
+conf-requirements/
+docs/
+store/
+
+# Отчёты миграции цвета — генерируются каждым прогоном.
+migration-manifest.yaml
+migration-colors-report.json
+migration-colors-report.md

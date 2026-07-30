@@ -1,0 +1,12 @@
+# Минимальные зависимости для выгрузки дерева страниц Confluence в markdown.
+# Версии закреплены под Python 3.12 / Windows x64 (совпадают с проверенной средой сборки).
+# Транзитивные зависимости лежат готовыми колёсами в каталоге wheels/.
+anyio==4.12.1
+atlassian-python-api==3.41.21
+beautifulsoup4==4.14.3
+cachetools==5.5.2
+markdownify==1.1.0
+python-dotenv==1.2.1
+PyYAML==6.0.3
+requests==2.32.5
+tenacity==9.1.2

@@ -1,0 +1,15 @@
+{
+  "templates": {
+    "BRD": "20808711",
+    "process": "20808714",
+    "states": "20808715",
+    "dataModel": "32246088",
+    "function": "20808730",
+    "integration": "136386636",
+    "control": "20808751",
+    "notification": "20808752",
+    "printFrom": "20808750",
+    "screenListForm": "20808723",
+    "screenItemForm": "23366529"
+  }
+}

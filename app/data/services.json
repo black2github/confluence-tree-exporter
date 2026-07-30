@@ -1,0 +1,608 @@
+[
+  {
+    "code": "roleModel",
+    "key": "RM",
+    "name": "[ЦРМ] Роли и Ролевая модель (Концепция)",
+    "platform": true
+  },
+  {
+    "code": "biometrics",
+    "key": "BM",
+    "name": "[БПО] Сервис биометрической идентификации",
+    "platform": true
+  },
+  {
+    "code": "IOCustomer",
+    "key": "KO",
+    "name": "[ИО Клиент] Сервис по обработке сообщения ИО Клиент",
+    "platform": true
+  },
+  {
+    "code": "SUV",
+    "key": "SV",
+    "name": "[СУВ] Сервис по работе с сообщениями СУВ",
+    "platform": true
+  },
+  {
+    "code": "signature",
+    "key": "SG",
+    "name": "[ЭП] Сервис по работе с электронной подписью",
+    "platform": true
+  },
+  {
+    "code": "notifications",
+    "key": "NT",
+    "name": "[Уведомления] Сервис работы с уведомлениями",
+    "platform": true
+  },
+  {
+    "code": "information",
+    "key": "NN",
+    "name": "[Информ] Сервис информирования",
+    "platform": true
+  },
+  {
+    "code": "notices",
+    "key": "NC",
+    "name": "[Нотификация] Сервис по работе с нотификациями",
+    "platform": true
+  },
+  {
+    "code": "dataModel",
+    "key": "DM",
+    "name": "Модель данных",
+    "platform": true
+  },
+  {
+    "code": "integrations",
+    "key": "INT",
+    "name": "Интеграция",
+    "platform": true
+  },
+  {
+    "code": "UAA",
+    "key": "UAA",
+    "name": "[UAA] Сервис аутентификации и авторизации",
+    "platform": true
+  },
+  {
+    "code": "userProfile",
+    "key": "UP",
+    "name": "[Профиль] Сервис по работе с профилем пользователя",
+    "platform": true
+  },
+  {
+    "code": "clientDirectory",
+    "key": "CD",
+    "name": "[Клиент] Справочник Клиентов Банка",
+    "platform": true
+  },
+  {
+    "code": "bankBranchDirectory",
+    "key": "BR",
+    "name": "[Подразделение] Справочник филиалов и подразделений",
+    "platform": true
+  },
+  {
+    "code": "settings",
+    "key": "ST",
+    "name": "[Настройки системы] Сервис настроек",
+    "platform": true
+  },
+  {
+    "code": "svetofor",
+    "key": "SM",
+    "name": "[Свет] Сервис \"Светофор\"",
+    "platform": true
+  },
+  {
+    "code": "statementImport",
+    "key": "SI",
+    "name": "[Импорт выписки] Сервис импорта выписки",
+    "platform": true
+  },
+  {
+    "code": "f1AccountsObtaining",
+    "key": "SF",
+    "name": "[Счета РКО Ф1] Сервис получения счетов из РКО Ф1",
+    "platform": true
+  },
+  {
+    "code": "backgroundProcess",
+    "key": "BP",
+    "name": "[СФП] Сервис фоновых процессов",
+    "platform": true
+  },
+  {
+    "code": "EPR",
+    "key": "EP",
+    "name": "[ЕПР] Сервис распознавания паспортных данных",
+    "platform": true
+  },
+  {
+    "code": "userAdministration",
+    "key": "UR",
+    "name": "[АППС] Администрирование прав пользователей системы",
+    "platform": true
+  },
+  {
+    "code": "accountCard",
+    "key": "AK",
+    "name": "[КС] Карточка счета",
+    "platform": true
+  },
+  {
+    "code": "SBP",
+    "key": "SBP",
+    "name": "[СБП] Система быстрых платежей",
+    "platform": false
+  },
+  {
+    "code": "contractorVerification",
+    "key": "CV",
+    "name": "[Контрагенты] Сервис проверки контрагентов",
+    "platform": false
+  },
+  {
+    "code": "ONC",
+    "key": "KC",
+    "name": "[ОНК] Сервис Онлайн-кассы",
+    "platform": false
+  },
+  {
+    "code": "CC",
+    "key": "CORP_CARDS",
+    "name": "[КК] Корпоративные Карты",
+    "platform": false
+  },
+  {
+    "code": "DSF",
+    "key": "DS",
+    "name": "[ДСФ] Сервис писем",
+    "platform": false
+  },
+  {
+    "code": "ADM",
+    "key": "ADM",
+    "name": "[АДМ] Сервис Онлайн Инкассация",
+    "platform": false
+  },
+  {
+    "code": "calendar",
+    "key": "DEALS_CALENDAR",
+    "name": "[Календарь] Сервис \"Календарь сделок ЮЛ\"",
+    "platform": false
+  },
+  {
+    "code": "mainPage",
+    "key": "MAIN_PAGE",
+    "name": "[ГС 2.0] Главная страница",
+    "platform": false
+  },
+  {
+    "code": "ONB_KZ",
+    "key": "ONB_KZ",
+    "name": "[ОНБ_КЗ] Сервис открытия 1го счёта клиентам МСБ",
+    "platform": false
+  },
+  {
+    "code": "ONB",
+    "key": "ONB2",
+    "name": "[ОНБ_2021] Сервис открытия 1-го счета клиента (онбординг)",
+    "platform": false
+  },
+  {
+    "code": "employees",
+    "key": "EMPLOYEES",
+    "name": "[Сотрудники] Сервис управления перечнем сотрудников организации",
+    "platform": false
+  },
+  {
+    "code": "customerInfoUpdate",
+    "key": "CU",
+    "name": "[Обнов_Свед] Обновление сведений о клиенте",
+    "platform": false
+  },
+  {
+    "code": "accountReservation",
+    "key": "RESERVATION",
+    "name": "[Резерв] Сервис резервирования счетов",
+    "platform": false
+  },
+  {
+    "code": "clientContactNeed",
+    "key": "CCS",
+    "name": "[НСК] Сервис \"Необходимо связаться с клиентом\"",
+    "platform": false
+  },
+  {
+    "code": "1stClientAccountAtBankOffice",
+    "key": "BF",
+    "name": "[ОНБ_ФО] Сервис открытия 1-го счета клиента в офисе Банка",
+    "platform": false
+  },
+  {
+    "code": "1stClientAccountAndRegisterAtSite",
+    "key": "AE",
+    "name": "[ОНБ_В] Сервис открытия 1-го счета и регистрации клиента во внешней части сайта",
+    "platform": false
+  },
+  {
+    "code": "ONB_FNS",
+    "key": "ONB_FNS",
+    "name": "[ОНБ_ФНС] Сервис открытия 1-го счета клиента через сервис ФНС",
+    "platform": false
+  },
+  {
+    "code": "fieldManager",
+    "key": "FM",
+    "name": "[ВМ] Выездной менеджер",
+    "platform": false
+  },
+  {
+    "code": "o2Plus",
+    "key": "O2PLUS",
+    "name": "[O2+NEW] Сервис заключения ДБС и открытия дополнительного счета",
+    "platform": false
+  },
+  {
+    "code": "offerAcceptance",
+    "key": "AO_RKO",
+    "name": "[АО_РКО] Сервис акцепта оферты",
+    "platform": false
+  },
+  {
+    "code": "RKOservices",
+    "key": "RKO",
+    "name": "[РКО] Сервис услуг РКО",
+    "platform": false
+  },
+  {
+    "code": "referenceRequest",
+    "key": "REF",
+    "name": "[Справки] Сервис запроса справок для ЮЛ",
+    "platform": false
+  },
+  {
+    "code": "AO_MP",
+    "key": "LM",
+    "name": "[АО_МП] Сервис подключения к ЛК МП",
+    "platform": false
+  },
+  {
+    "code": "LK_UVED",
+    "key": "LK_UVED",
+    "name": "[АО_УВЭД] Сервис подключения к ЛК УВЭД",
+    "platform": false
+  },
+  {
+    "code": "FNS",
+    "key": "FNS",
+    "name": "[ФНС] Сервис по работе с ФНС",
+    "platform": false
+  },
+  {
+    "code": "brokerage",
+    "key": "BROKERAGE_BS",
+    "name": "[БРК] Брокеридж",
+    "platform": false
+  },
+  {
+    "code": "visaOfDocuments",
+    "key": "APPROVAL_SIGN",
+    "name": "[Визирование] Сервис Визирования",
+    "platform": false
+  },
+  {
+    "code": "RKO_PP",
+    "key": "RN",
+    "name": "[РРКО_ПП_NEW] Рублевое платежное поручение",
+    "platform": false
+  },
+  {
+    "code": "RKO_Accept_PT",
+    "key": "RT",
+    "name": "[РРКО_Акцепт ПТ] Сервис Акцепта Платежного Требования",
+    "platform": false
+  },
+  {
+    "code": "RKO_Outgoing_IP",
+    "key": "KP",
+    "name": "[РРКО_ИПИ] Инкассовое поручение (исходящее)",
+    "platform": false
+  },
+  {
+    "code": "RKO_Incoming_IP",
+    "key": "KG",
+    "name": "[РРКО_ИПВ] Инкассовое поручение (входящее)",
+    "platform": false
+  },
+  {
+    "code": "RKO_Outgoing_PT",
+    "key": "SD",
+    "name": "[РРКО_ПТИ] Сервис Платежного Требования Исходящего",
+    "platform": false
+  },
+  {
+    "code": "RKO_Incoming_PT",
+    "key": "SP",
+    "name": "[РРКО_ПТВ] Сервис Платежного Требования Входящего",
+    "platform": false
+  },
+  {
+    "code": "VRKO_CurrencyTransferOrder",
+    "key": "VP",
+    "name": "[ВРКО_ВП] Поручение на перевод валюты",
+    "platform": false
+  },
+  {
+    "code": "VRKO_TransitCurrencyAccountOrder",
+    "key": "VT",
+    "name": "[ВРКО_ППТС] Поручение на списание средств с транзитного валютного счета",
+    "platform": false
+  },
+  {
+    "code": "VRKO_CurrencyConversion",
+    "key": "VC",
+    "name": "[ВРКО_Конв] Поручения на покупку/продажу валюты",
+    "platform": false
+  },
+  {
+    "code": "VRKO_CurrencyControlDocuments",
+    "key": "VD",
+    "name": "[ВРКО_ДВК] Документы валютного контроля",
+    "platform": false
+  },
+  {
+    "code": "VRKO_ControlMessage",
+    "key": "VM",
+    "name": "[ДВК__СВК1] Сообщение валютному контролеру",
+    "platform": false
+  },
+  {
+    "code": "VRKO_MessageFromControl",
+    "key": "V2",
+    "name": "[ДВК_СВК2] Сервис \"Сообщение валютного контролера\"",
+    "platform": false
+  },
+  {
+    "code": "VRKO_CCD",
+    "key": "V3",
+    "name": "[ДВК] Документы валютного контроля",
+    "platform": false
+  },
+  {
+    "code": "VRKO_DIO",
+    "key": "V4",
+    "name": "[ДВК_ДИО] Документы и информация к операции",
+    "platform": false
+  },
+  {
+    "code": "VRKO_Import",
+    "key": "VG",
+    "name": "[ВРКО_Импорт] Импорт",
+    "platform": false
+  },
+  {
+    "code": "VRKO_Autoquoting",
+    "key": "VQ",
+    "name": "[ВРКО_АК] Автокотирование",
+    "platform": false
+  },
+  {
+    "code": "paymentElectronicDocuments",
+    "key": "PE",
+    "name": "[ПЭД] Сервисы работы с Платежными Электронными Документами",
+    "platform": false
+  },
+  {
+    "code": "paymentDocumentsMonitoring",
+    "key": "RD",
+    "name": "Мониторинг расчетных документов",
+    "platform": false
+  },
+  {
+    "code": "paymentDocumentsRevocationRequest",
+    "key": "DR",
+    "name": "[Отзыв ПЭД] Запрос на отзыв",
+    "platform": false
+  },
+  {
+    "code": "blockings",
+    "key": "BL",
+    "name": "[Блокировки ОЭП] Сервис по работе с блокировками",
+    "platform": false
+  },
+  {
+    "code": "accountStatement",
+    "key": "AS",
+    "name": "[Выписки] Сервис работы с выпиской",
+    "platform": false
+  },
+  {
+    "code": "scheduledAccountStatement",
+    "key": "SS",
+    "name": "[ВПР_new] Выписка по расписанию",
+    "platform": false
+  },
+  {
+    "code": "chatBot",
+    "key": "HB",
+    "name": "[ЧБ] Сервисы Чат-бота",
+    "platform": false
+  },
+  {
+    "code": "cashRequest",
+    "key": "RV",
+    "name": "[Заказ наличных] Сервис обработки заявок на выдачу и внесение наличных денежных средств",
+    "platform": false
+  },
+  {
+    "code": "cloudAndUnqualifiedSignatureGeneration",
+    "key": "SK",
+    "name": "[ГЭП] Сервис генерации ОЭП/НЭП",
+    "platform": false
+  },
+  {
+    "code": "signatureRegistration",
+    "key": "SR",
+    "name": "[РЭП] Сервис регистрации НЭП/КЭП",
+    "platform": false
+  },
+  {
+    "code": "leasing",
+    "key": "LEASING_BS",
+    "name": "[Лизинг] Сервис лизинга",
+    "platform": false
+  },
+  {
+    "code": "controlAndPaymentsAcceptance",
+    "key": "PA",
+    "name": "[КиА] Контроль и акцепт платежей",
+    "platform": false
+  },
+  {
+    "code": "accountBlocking",
+    "key": "AB",
+    "name": "[БлокСч] Сервис блокировок счетов",
+    "platform": false
+  },
+  {
+    "code": "accountClosing",
+    "key": "ACCOUNT_CLOSING",
+    "name": "[ЗакрСчета] Сервис закрытия счета",
+    "platform": false
+  },
+  {
+    "code": "documentCoping",
+    "key": "DOC_COPY",
+    "name": "[КопииДок] Сервис предоставления копий документов",
+    "platform": false
+  },
+  {
+    "code": "1CDirectBank",
+    "key": "DB",
+    "name": "[DirectBank] Сервис \"1C:DirectBank\"",
+    "platform": false
+  },
+  {
+    "code": "operationsFeed",
+    "key": "LO",
+    "name": "[ЛО] Сервис Лента операций",
+    "platform": false
+  },
+  {
+    "code": "DPP",
+    "key": "DP",
+    "name": "[ДПП] Сервис динамических продуктовых предложений",
+    "platform": false
+  },
+  {
+    "code": "paymentDocumentDirectories",
+    "key": "PD",
+    "name": "[СпрРКО] Справочники платежных документов",
+    "platform": false
+  },
+  {
+    "code": "openApi",
+    "key": "MB",
+    "name": "[Мультибанкинг] Сервис обмена данными через openApi",
+    "platform": false
+  },
+  {
+    "code": "orderQueue",
+    "key": "RQ",
+    "name": "[Очереди РКО] Сервис очереди распоряжений",
+    "platform": false
+  },
+  {
+    "code": "requestWidget",
+    "key": "RW",
+    "name": "[Виджет_Заявки]",
+    "platform": false
+  },
+  {
+    "code": "safeBusiness",
+    "key": "BB",
+    "name": "[ББ] Безопасный бизнес",
+    "platform": false
+  },
+  {
+    "code": "OTP",
+    "key": "OT",
+    "name": "[OTP] OTP - Сервис",
+    "platform": false
+  },
+  {
+    "code": "BRK",
+    "key": "CR",
+    "name": "CRM БРК",
+    "platform": false
+  },
+  {
+    "code": "EPR",
+    "key": "EP",
+    "name": "АС ЕПР",
+    "platform": false
+  },
+  {
+    "code": "EFR",
+    "key": "EF",
+    "name": "АС ЕФР",
+    "platform": false
+  },
+  {
+    "code": "STP",
+    "key": "ST",
+    "name": "АС СТОПЛИСТ",
+    "platform": false
+  },
+  {
+    "code": "BSK",
+    "key": "BSK",
+    "name": "БСК",
+    "platform": false
+  },
+  {
+    "code": "ESIA",
+    "key": "ES",
+    "name": "ЕСИА",
+    "platform": false
+  },
+  {
+    "code": "ESK",
+    "key": "EK",
+    "name": "ЕСК (ЦФТ ГО)",
+    "platform": false
+  },
+  {
+    "code": "KNOSIS",
+    "key": "KN",
+    "name": "КНОСИС",
+    "platform": false
+  },
+  {
+    "code": "PC",
+    "key": "PC",
+    "name": "ПЦ SVFE",
+    "platform": false
+  },
+  {
+    "code": "F1",
+    "key": "F1",
+    "name": "РКО Ф1",
+    "platform": false
+  },
+  {
+    "code": "TESSA",
+    "key": "TS",
+    "name": "ТЕССА",
+    "platform": false
+  },
+  {
+    "code": "SBPG",
+    "key": "SG",
+    "name": "АС СБП",
+    "platform": false
+  }
+]
