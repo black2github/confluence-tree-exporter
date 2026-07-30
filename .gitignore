@@ -14,6 +14,10 @@ conf-requirements/
 docs/
 store/
 
+# Архив бандла для переноса в контур — производное от исходников, пересобирается.
+confluence-tree-exporter.zip
+*.zip
+
 # Отчёты миграции цвета — генерируются каждым прогоном.
 migration-manifest.yaml
 migration-colors-report.json
