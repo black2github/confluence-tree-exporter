@@ -2132,6 +2132,14 @@ class ContentExtractor:
                         # \u041f\u0443\u043d\u043a\u0442 \u0443\u0445\u043e\u0434\u0438\u0442 \u0432 \u0441\u044b\u0440\u043e\u0439 HTML-\u0441\u043f\u0438\u0441\u043e\u043a \u2014 \u043a\u0430\u043a \u0438 \u0432 \u044f\u0447\u0435\u0439\u043a\u0435,
                         # '<' \u043f\u0435\u0440\u0435\u0434 \u043b\u0430\u0442\u0438\u043d\u0438\u0446\u0435\u0439 \u044d\u043a\u0440\u0430\u043d\u0438\u0440\u0443\u0435\u0442\u0441\u044f \u043e\u0431\u0440\u0430\u0442\u043d\u043e.
                         li_parts.append(_escape_stray_tag_openers(text))
+                    elif text and li_parts and not li_parts[-1].endswith((" ", "\n")):
+                        # Чисто пробельный узел между инлайн-элементами — это
+                        # разделитель: границы <strong>/цветных <span> часто
+                        # оставляют пробел отдельным узлом, и его отбрасывание
+                        # склеивает соседей («Если<a …»). Схлопываем до одного
+                        # пробела; в начале пункта и после уже имеющегося
+                        # пробела не добавляем.
+                        li_parts.append(" ")
                 elif isinstance(child, Tag):
                     if self._is_ignored_element(child):
                         continue
@@ -2142,6 +2150,18 @@ class ContentExtractor:
                         link = self._process_link(child, "nested_table_cell")
                         if link:
                             li_parts.append(link)
+                    elif child.name in ["strong", "b"]:
+                        # Прямой жирный потомок пункта: без этой ветки уходил в
+                        # общий else и терял обёртку <strong>. Краевые пробелы —
+                        # за тег, как в _process_nested_table_cell_content.
+                        bold_content = self._process_nested_table_cell_content(child)
+                        stripped = bold_content.strip()
+                        if stripped:
+                            leading = bold_content[: len(bold_content) - len(bold_content.lstrip())]
+                            trailing = bold_content[len(bold_content.rstrip()):]
+                            li_parts.append(f"{leading}<strong>{stripped}</strong>{trailing}")
+                        elif bold_content:
+                            li_parts.append(bold_content)
                     else:
                         content = self._process_nested_table_cell_content(child)
                         if content:
