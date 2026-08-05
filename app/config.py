@@ -65,6 +65,17 @@ REMOVE_HISTORY_SECTIONS = os.getenv("REMOVE_HISTORY_SECTIONS", "true").lower() i
 # экстракторов content_extractor, поэтому CLI-флаг может переопределить его в рантайме.
 MIGRATE_IMAGES = os.getenv("MIGRATE_IMAGES", "false").lower() in ("1", "true", "yes")
 
+# По умолчанию файлы-вложения (ссылки /download/attachments/: .vsdx, .docx, архивы…)
+# НЕ скачиваются — ссылки остаются серверными путями Confluence. Если включить —
+# файлы скачиваются в подкаталог files/ рядом с .md, ссылка заменяется относительной.
+# Скрипты миграции понимают флаг --with-attachments, переопределяющий это значение.
+# ВНИМАНИЕ: читается динамически (app.config.MIGRATE_ATTACHMENTS) на слое миграции.
+MIGRATE_ATTACHMENTS = os.getenv("MIGRATE_ATTACHMENTS", "false").lower() in ("1", "true", "yes")
+
+# Размерный лимит скачиваемого вложения, МБ; сверх — файл пропускается с записью
+# в лог (серверная ссылка остаётся в тексте, тихих потерь нет).
+ATTACHMENT_MAX_MB = int(os.getenv("ATTACHMENT_MAX_MB", "50"))
+
 # По умолчанию зачёркнутый (<s>) текст следует общей логике: в approved-режиме
 # выкидывается, под --all — сохраняется как часть неутверждённого содержимого.
 # Если включить — зачёркнутый текст исключается ПРИ ЛЮБОМ раскладе (в т.ч. под --all).

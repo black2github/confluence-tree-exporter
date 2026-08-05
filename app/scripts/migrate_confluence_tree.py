@@ -231,6 +231,17 @@ def save_page_file(
         if downloaded or failed:
             logger.info("  🖼 Картинки '%s': скачано %d, ошибок %d", title, downloaded, failed)
 
+    # Миграция файлов-вложений (--with-attachments): ссылки /download/attachments/…
+    # скачиваются в files/ рядом с .md и заменяются относительными.
+    if _config.MIGRATE_ATTACHMENTS:
+        from app.attachment_migrator import migrate_file_attachments_in_content
+        content_md, a_dl, a_fail, a_skip = migrate_file_attachments_in_content(
+            content_md, str(page_id), filepath
+        )
+        if a_dl or a_fail or a_skip:
+            logger.info("  📎 Вложения '%s': скачано %d, ошибок %d, пропущено по размеру %d",
+                        title, a_dl, a_fail, a_skip)
+
     page = {
         "id": page_id,
         "title": title,
@@ -623,13 +634,14 @@ def main():
     # --drop-strikethrough можно указать в любом месте аргументов; они переопределяют
     # соответствующие значения из конфигурации.
     flags = {"--http", "--all", "--tasks", "--keep-history", "--with-images",
-             "--with-index", "--drop-strikethrough"}
+             "--with-attachments", "--with-index", "--drop-strikethrough"}
     args = [a for a in sys.argv[1:] if a not in flags]
     use_http = ("--http" in sys.argv) or CONFLUENCE_USE_HTTP
     include_unapproved = ("--all" in sys.argv) or MIGRATE_INCLUDE_UNAPPROVED
     critic = "--tasks" in sys.argv
     keep_history = "--keep-history" in sys.argv
     with_images = "--with-images" in sys.argv
+    with_attachments = "--with-attachments" in sys.argv
     with_index = "--with-index" in sys.argv
     drop_strikethrough = "--drop-strikethrough" in sys.argv
 
@@ -673,6 +685,12 @@ def main():
     if with_images:
         import app.config as _config
         _config.MIGRATE_IMAGES = True
+
+    # Включаем миграцию файлов-вложений (files/ рядом с .md); слой миграции читает
+    # app.config.MIGRATE_ATTACHMENTS динамически.
+    if with_attachments:
+        import app.config as _config
+        _config.MIGRATE_ATTACHMENTS = True
 
     # Исключение зачёркнутого текста при любом раскладе. Фабрики экстракторов читают
     # app.config.EXCLUDE_STRIKETHROUGH динамически — флаг выставляем ДО конвертации.
