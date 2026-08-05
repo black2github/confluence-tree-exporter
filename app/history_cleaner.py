@@ -140,7 +140,7 @@ def _remove_paragraph_history_sections(soup: BeautifulSoup) -> int:
     for p in paragraphs:
         p_text = p.get_text(strip=True).lower()
 
-        if _is_history_text(p_text):
+        if _is_history_heading_paragraph(p_text):
             logger.debug("[_remove_paragraph_history_sections] Removing paragraph: %s", p_text)
 
             # Удаляем сам параграф
@@ -185,9 +185,40 @@ def _remove_history_tables_by_headers(soup: BeautifulSoup) -> int:
     return removed_count
 
 
+def _is_history_heading_paragraph(text: str) -> bool:
+    """
+    Строгий детектор для АБЗАЦЕВ: абзац — заголовок секции истории, только если
+    текст НАЧИНАЕТСЯ с маркера и короткий (заголовок, а не требование).
+
+    Подстрочный поиск здесь запрещён: «история изменений» встречается внутри
+    содержательных требований («…создание записи в сущности История изменений
+    сообщения о блокировках Н2Н») — инцидент 2026-08-05, страница [БлокН2Н]:
+    ложное срабатывание удалило абзац и следующий div со всеми таблицами
+    процесса. Удаляющая эвристика обязана иметь ограничитель на НЕсрабатывание
+    (принцип асимметрии: тихая потеря требования хуже неудалённой истории).
+    """
+    if not text:
+        return False
+
+    text = text.lower().strip()
+    if len(text) > 60:  # заголовочный абзац короткий; требование — нет
+        return False
+
+    heading_starts = (
+        'история изменений',
+        'change history',
+        'revision history',
+    )
+    return text.startswith(heading_starts)
+
+
 def _is_history_text(text: str) -> bool:
     """
     Проверяет, содержит ли текст признаки истории изменений.
+
+    ВНИМАНИЕ: подстрочный поиск — применять только к коротким «заголовочным»
+    текстам (expand-контрол, h1–h6, ID якорей); для абзацев использовать
+    строгий _is_history_heading_paragraph (см. его докстринг об инциденте).
     """
     if not text:
         return False
