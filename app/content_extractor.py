@@ -785,6 +785,16 @@ class ContentExtractor:
                 # Вложенность цветов (ТЗ п. 4.5): если внутри есть фрагмент ДРУГОГО цвета —
                 # уплощаем в один маркер под внутренней задачей, а не вкладываем маркеры.
                 outer_norm = normalize_color(self._element_own_color(element) or "")
+                # ПЕРВЫМ делом — виден ли собственный цвет элемента хоть на одном
+                # текстовом прогоне (CSS: внутренний цвет перекрывает внешний).
+                # Спан-обёртка, весь текст которой перекрашен изнутри в чёрный, —
+                # это ПРОМ-текст: маркер на нём привёл бы к его удалению при
+                # reject/reject-all (инцидент 2026-08-06, «Получить выписку в
+                # КНОСИС»: {++UNKNOWN-ff6600: <Комментарий для Банка> =++} поверх
+                # чёрного требования). Проверка обязана стоять ДО уплощения:
+                # раньше уплощение перехватывало такие конструкции.
+                if not self._element_effectively_colored(element, outer_norm):
+                    return self._dispatch_element(element, context)
                 if self._has_nested_diff_color(element, outer_norm):
                     return self._flatten_nested_critic(element)
                 # Признак 2 (ТЗ п. 4.5.2, confidence: medium): зачёркнутый фрагмент вплотную
@@ -884,6 +894,14 @@ class ContentExtractor:
         if not self._is_edit_color(color):
             return None
         norm = normalize_color(color)
+        # Цвет обязан быть ВИДИМЫМ (CSS: внутренний перекрывает внешний): спан-обёртка,
+        # весь текст которой перекрашен изнутри в чёрный, — это ПРОМ-текст, а не правка.
+        # Без этой проверки маркер-вставка ложится на утверждённое требование и
+        # reject/reject-all удаляет его молча (инцидент 2026-08-06, «Получить выписку
+        # в КНОСИС»). Проверка здесь, в общем узле, — её проходят оба пути разметки:
+        # обычный обход и HTML-острова таблиц.
+        if not self._element_effectively_colored(element, norm):
+            return None
         task = self.config.color_map.get(norm) or ("UNKNOWN-" + norm.lstrip("#"))
         kind = "del" if self._is_strikethrough(element) else "ins"
         return task, kind
@@ -943,12 +961,17 @@ class ContentExtractor:
         return found
 
     def _has_nested_diff_color(self, element: Tag, outer_norm: Optional[str]) -> bool:
-        """Есть ли внутри element потомок-правка с ДРУГИМ (не outer) цветом."""
+        """Есть ли внутри element потомок-правка с ДРУГИМ (не outer) ВИДИМЫМ цветом.
+
+        Учитываются только цвета, эффективные хотя бы для одного текстового прогона:
+        спан-обёртка, чей цвет целиком перекрыт изнутри, вложенности не создаёт
+        (иначе уплощение затянуло бы под маркер чёрный ПРОМ-текст).
+        """
         for tag in element.find_all(True):
             color = self._element_own_color(tag)
             if self._is_edit_color(color):
                 norm = normalize_color(color)
-                if norm and norm != outer_norm:
+                if norm and norm != outer_norm and self._element_effectively_colored(tag, norm):
                     return True
         return False
 
