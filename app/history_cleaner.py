@@ -328,8 +328,10 @@ def _get_following_history_elements(element: Tag) -> list:
             continue
 
         if isinstance(next_sibling, Tag):
-            # Проверяем, относится ли элемент к истории изменений
-            if _is_history_related_element(next_sibling):
+            # Первый следующий элемент принадлежит заголовку по структуре;
+            # дальше — только распознанные таблицы истории (см. ограничитель).
+            is_first = not following_elements
+            if _is_history_related_element(next_sibling, is_first=is_first):
                 following_elements.append(next_sibling)
                 next_sibling = next_sibling.next_sibling
             else:
@@ -341,27 +343,34 @@ def _get_following_history_elements(element: Tag) -> list:
     return following_elements
 
 
-def _is_history_related_element(element: Tag) -> bool:
+def _is_history_related_element(element: Tag, is_first: bool = False) -> bool:
     """
-    Проверяет, относится ли элемент к истории изменений.
+    Относится ли элемент, следующий за заголовком истории, к самой истории.
+
+    Правило-ограничитель: **первая** таблица (или div.table-wrap) сразу за
+    заголовком принадлежит ему по структуре документа — она история, даже если
+    колонки нестандартные. Все последующие — только если РАСПОЗНАНЫ как таблица
+    истории (колонки Дата/Описание/Автор/Задача в JIRA), т.е. история разбита
+    на несколько таблиц.
+
+    Раньше удалялась ЛЮБАЯ следующая таблица подряд: содержательная таблица,
+    идущая за историей без заголовка-разделителя, исчезала молча (найдено
+    2026-08-06 прогоном тестов; четвёртый инцидент класса «удаляющая эвристика
+    без ограничителя»). Асимметрия: нераспознанный хвост истории останется в
+    выгрузке шумом — это дешевле невосстановимой потери требований.
     """
     if not element or not element.name:
         return False
 
-    # Div с table-wrap - обычно содержит таблицу истории
-    if element.name == 'div':
-        classes = element.get('class', [])
-        if any('table-wrap' in str(cls) for cls in classes):
-            return True
-
-    # Прямая таблица
     if element.name == 'table':
+        tables = [element]
+    else:
+        classes = element.get('class', [])
+        is_wrap = any('table-wrap' in str(cls) for cls in classes)
+        tables = element.find_all('table')
+        if not tables and not is_wrap:
+            return False
+
+    if is_first:
         return True
-
-    # Проверяем, содержит ли элемент таблицу истории
-    tables = element.find_all('table')
-    for table in tables:
-        if _is_history_table(table):
-            return True
-
-    return False
+    return any(_is_history_table(t) for t in tables)
