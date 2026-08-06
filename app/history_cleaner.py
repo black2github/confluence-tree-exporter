@@ -85,7 +85,7 @@ def _remove_expand_history_blocks(soup: BeautifulSoup) -> int:
 
         # Проверяем текст в expand-control
         control_text = expand_control.get_text(strip=True).lower()
-        if _is_history_text(control_text):
+        if _is_history_title(control_text):
             logger.debug("[_remove_expand_history_blocks] Removing expand container: %s", control_text)
             container.extract()
             removed_count += 1
@@ -108,7 +108,7 @@ def _remove_header_history_sections(soup: BeautifulSoup) -> int:
         header_id = header.get('id', '').lower()
 
         # Проверяем текст заголовка или его ID
-        if _is_history_text(header_text) or _is_history_text(header_id):
+        if _is_history_title(header_text):  # id-якорь НЕ проверяется: несёт имя страницы (инцидент 2026-08-06)
             logger.debug("[_remove_header_history_sections] Removing header: %s", header_text)
 
             # Удаляем сам заголовок
@@ -140,7 +140,7 @@ def _remove_paragraph_history_sections(soup: BeautifulSoup) -> int:
     for p in paragraphs:
         p_text = p.get_text(strip=True).lower()
 
-        if _is_history_heading_paragraph(p_text):
+        if _is_history_title(p_text):
             logger.debug("[_remove_paragraph_history_sections] Removing paragraph: %s", p_text)
 
             # Удаляем сам параграф
@@ -185,31 +185,36 @@ def _remove_history_tables_by_headers(soup: BeautifulSoup) -> int:
     return removed_count
 
 
-def _is_history_heading_paragraph(text: str) -> bool:
+def _is_history_title(text: str) -> bool:
     """
-    Строгий детектор для АБЗАЦЕВ: абзац — заголовок секции истории, только если
-    текст НАЧИНАЕТСЯ с маркера и короткий (заголовок, а не требование).
+    Строгий детектор заголовка секции истории: ТОЧНОЕ совпадение
+    нормализованного текста со словарём канонических названий.
 
-    Подстрочный поиск здесь запрещён: «история изменений» встречается внутри
-    содержательных требований («…создание записи в сущности История изменений
-    сообщения о блокировках Н2Н») — инцидент 2026-08-05, страница [БлокН2Н]:
-    ложное срабатывание удалило абзац и следующий div со всеми таблицами
-    процесса. Удаляющая эвристика обязана иметь ограничитель на НЕсрабатывание
-    (принцип асимметрии: тихая потеря требования хуже неудалённой истории).
+    Ни подстрока, ни startswith здесь недопустимы — два инцидента:
+    • 2026-08-05, [БлокН2Н]: «…создание записи в сущности История изменений
+      сообщения о блокировках Н2Н» в абзаце-требовании → удалён абзац и
+      следующий div со всеми таблицами процесса (подстрока);
+    • 2026-08-06, страница сущности «История изменений сообщения о
+      блокировках Н2Н»: её имя входит в id-якоря ВСЕХ заголовков страницы
+      (Confluence строит якорь как <Страница>-<Заголовок>) и в начало
+      названий — страница выпотрошена целиком (подстрока по id, и startswith
+      не спас бы).
+    Удаляющая эвристика обязана иметь ограничитель на НЕсрабатывание
+    (асимметрия: неудалённая история — шум; потерянное требование —
+    невосстановимо). Цена точности безопасна: нераспознанная вариация
+    названия оставит историю в выгрузке, а не потеряет содержимое.
     """
     if not text:
         return False
 
-    text = text.lower().strip()
-    if len(text) > 60:  # заголовочный абзац короткий; требование — нет
-        return False
-
-    heading_starts = (
+    text = re.sub(r"\s+", " ", text.lower()).strip().rstrip(":").strip()
+    return text in (
         'история изменений',
+        'история изменений требований',
+        'история изменения',
         'change history',
         'revision history',
     )
-    return text.startswith(heading_starts)
 
 
 def _is_history_text(text: str) -> bool:

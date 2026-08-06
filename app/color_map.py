@@ -39,7 +39,7 @@ COLUMN_SYNONYMS = {
 }
 
 # Маска идентификатора задачи Jira (ТЗ п. 4.2.г, финальный fallback).
-TASK_ID_RE = re.compile(r"\b[A-Z][A-Z0-9]{1,9}-\d+\b")
+TASK_ID_RE = re.compile(r"\b[A-Z][A-Z0-9]{1,19}-\d+\b")
 
 
 def _normalize_header(text: str) -> str:
@@ -158,14 +158,14 @@ def _resolve_jira_ids(cell: Tag) -> List[str]:
     # 2. Rendered-форма с сохранёнными параметрами макроса: data-macro-parameters="key=KEY|..."
     for tag in cell.find_all(attrs={"data-macro-parameters": True}):
         params = tag.get("data-macro-parameters") or ""
-        m = re.search(r"key=([A-Z][A-Z0-9]{1,9}-\d+)", params)
+        m = re.search(r"key=([A-Z][A-Z0-9]{1,19}-\d+)", params)
         if m:
             return [m.group(1)]
 
     # 3. Гиперссылка вида .../browse/KEY (разрешённый макрос в rendered view).
     hrefs: List[str] = []
     for a in cell.find_all("a", href=True):
-        m = re.search(r"/browse/([A-Z][A-Z0-9]{1,9}-\d+)", a["href"])
+        m = re.search(r"/browse/([A-Z][A-Z0-9]{1,19}-\d+)", a["href"])
         if m and m.group(1) not in hrefs:
             hrefs.append(m.group(1))
     if hrefs:
