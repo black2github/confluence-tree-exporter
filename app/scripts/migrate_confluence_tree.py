@@ -151,7 +151,30 @@ def _resolve_page_content(page_data: Dict, include_unapproved: bool, critic: boo
     approved (по умолчанию) / all (--all) / critic (--tasks). Критик-режим строит карту
     «цвет→задача» из raw_html (до удаления истории), гоняет create_critic_extractor и
     попутно наполняет аккумулятор отчёта (карта уже построена — без повторного разбора).
+
+    Эмуляция похода в RAG (2026-08-07): при непустом config.UNAPPROVED_JIRA_IDS
+    джира из ЧЁРНОЙ строки истории, входящая в список, означает «состав страницы
+    не утверждён». Реакция по режиму: critic — весь чёрный контент оборачивается
+    вставками этой задачи; approved — страница пропускается с предупреждением
+    (неутверждённому в подтверждённой выгрузке не место); all — контент полный,
+    но frontmatter получает status: draft (признак кладётся в page_data).
     """
+    import app.config as _config
+    forced = None
+    if _config.UNAPPROVED_JIRA_IDS:
+        from app.color_map import find_forced_unapproved
+        forced = find_forced_unapproved(
+            page_data.get("raw_html", "") or "", _config.UNAPPROVED_JIRA_IDS)
+        if forced:
+            page_data["_forced_unapproved"] = forced.task
+            for w in forced.warnings:
+                logger.warning("  ⚠ '%s': %s", name, w)
+            if not critic and not include_unapproved:
+                logger.warning(
+                    "  ⚠ '%s': состав не утверждён (%s) — страница пропущена в "
+                    "approved-режиме (используйте --tasks или --all)", name, forced.task)
+                return ""
+
     if critic:
         from app.color_map import build_color_task_map, survey_body_colors
         from app.content_extractor import create_critic_extractor
@@ -162,6 +185,28 @@ def _resolve_page_content(page_data: Dict, include_unapproved: bool, critic: boo
         content = extractor.extract(raw)
         # Пост-проход 4.5.4: отбросить {--C2: X--}, где X входит в состав чужой вставки.
         content, dropped = postpass_drop_contained_deletions(content)
+        if forced:
+            # Форс-обёртка неутверждённого состава: чёрные куски → вставки задачи.
+            from app.unapproved_wrap import wrap_unapproved
+            content, wrap_rep = wrap_unapproved(content, forced.task)
+            marks = (wrap_rep["blocks"] + wrap_rep["tables_wrapped"]
+                     + wrap_rep["table_rows"] + wrap_rep["island_rows"])
+            logger.info("  ⚑ '%s': состав не утверждён (%s) — обёрнуто %d фрагментов",
+                        name, forced.task, marks)
+            for w in wrap_rep["warnings"]:
+                logger.warning("  ⚠ '%s': %s", name, w)
+            if critic_acc is not None:
+                # Форс-задача — в реестр мигрировавших задач (по ней будут делать apply).
+                entry = critic_acc["tasks"].setdefault(
+                    forced.task, {"color": "black (forced-unapproved)",
+                                  "confidence": "forced", "pages": set(),
+                                  "markers": 0, "date": None})
+                entry["pages"].add(name)
+                entry["markers"] += marks
+                # дата первой записи — в предложение порядка вливания (2026-08-10)
+                if forced.first_seen and (entry["date"] is None
+                                          or forced.first_seen < entry["date"]):
+                    entry["date"] = forced.first_seen
         if critic_acc is not None:
             from app.scripts.migrate_colors import accumulate_page
             accumulate_page(critic_acc, name, result, survey_body_colors(raw, result))
@@ -251,12 +296,16 @@ def save_page_file(
 
     # Точный признак неподтверждённого контента: full_content и approved_content
     # различаются только при наличии цветных (неподтверждённых) фрагментов.
-    has_unapproved = page_data.get("full_content") != page_data.get("approved_content")
+    # Форс-режим (состав не утверждён по списку задач) — тоже неподтверждённое:
+    # страница обязана получить status: draft и в режиме --all, где маркеров нет.
+    has_unapproved = (page_data.get("full_content") != page_data.get("approved_content")
+                      or bool(page_data.get("_forced_unapproved")))
 
     frontmatter = page_to_frontmatter(
         page, service_code, source, doc_id,
         include_unapproved=include_unapproved or critic,  # критик — полное содержимое
         has_unapproved=has_unapproved,
+        unapproved_jira=page_data.get("_forced_unapproved", "") or "",
     )
     write_md_file(filepath, frontmatter, content_md)
 
@@ -630,12 +679,31 @@ def generate_section_indexes(base_dir: Path) -> int:
 
 
 def main():
+    # Версия при старте: сверка бандлов на внутреннем/внешнем контуре глазами
+    # (совпадать должны и номер, и отпечаток исходников).
+    from app.version import banner
+    logger.info(banner("confluence-tree-exporter"))
+    logger.info("")
+
     # Флаги --http, --all, --keep-history, --with-images, --with-index и
     # --drop-strikethrough можно указать в любом месте аргументов; они переопределяют
     # соответствующие значения из конфигурации.
     flags = {"--http", "--all", "--tasks", "--keep-history", "--with-images",
              "--with-attachments", "--with-index", "--drop-strikethrough"}
-    args = [a for a in sys.argv[1:] if a not in flags]
+
+    # Ключ со значением: --unapproved-jira <file.json> — список Jira ID неутверждённых
+    # задач (эмуляция похода в RAG). Извлекается ДО построения позиционных args.
+    argv = list(sys.argv[1:])
+    unapproved_path = None
+    if "--unapproved-jira" in argv:
+        k = argv.index("--unapproved-jira")
+        if k + 1 >= len(argv) or argv[k + 1].startswith("--"):
+            print("ОШИБКА: --unapproved-jira требует путь к JSON-файлу со списком Jira ID.")
+            sys.exit(2)
+        unapproved_path = argv[k + 1]
+        del argv[k:k + 2]
+
+    args = [a for a in argv if a not in flags]
     use_http = ("--http" in sys.argv) or CONFLUENCE_USE_HTTP
     include_unapproved = ("--all" in sys.argv) or MIGRATE_INCLUDE_UNAPPROVED
     critic = "--tasks" in sys.argv
@@ -664,6 +732,9 @@ def main():
               "python migrate_confluence_tree.py 12345 CORP_CARDS лимиты --all")
         print("Example (разметка задач CriticMarkup + манифест/отчёт): "
               "python migrate_confluence_tree.py 12345 CORP_CARDS лимиты --tasks")
+        print("Example (список неутверждённых задач — состав таких страниц метится "
+              "вставками): python migrate_confluence_tree.py 12345 CORP_CARDS лимиты "
+              "--tasks --unapproved-jira unapproved.json")
         print("Example (сохранить раздел 'История изменений'): "
               "python migrate_confluence_tree.py 12345 CORP_CARDS лимиты --keep-history")
         print("Example (мигрировать картинки в img/ рядом с .md): "
@@ -673,6 +744,30 @@ def main():
         print("Example (исключить зачёркнутый текст при любом раскладе, в т.ч. с --all): "
               "python migrate_confluence_tree.py 12345 CORP_CARDS лимиты --all --drop-strikethrough")
         sys.exit(1)
+
+    # Список неутверждённых задач (эмуляция похода в RAG): JSON — либо список строк,
+    # либо {"unapproved_jira": [...]}. Ключа нет — конвейер работает как раньше.
+    if unapproved_path:
+        import json as _json
+        import app.config as _cfg
+        from app.color_map import TASK_ID_RE as _task_re
+        try:
+            data = _json.loads(Path(unapproved_path).read_text(encoding="utf-8"))
+        except (OSError, ValueError) as e:
+            print(f"ОШИБКА: не удалось прочитать {unapproved_path}: {e}")
+            sys.exit(2)
+        ids = data.get("unapproved_jira") if isinstance(data, dict) else data
+        if not isinstance(ids, list) or not all(isinstance(x, str) for x in ids):
+            print(f"ОШИБКА: {unapproved_path} должен содержать список строк Jira ID "
+                  '(["GBO-1", ...]) или {"unapproved_jira": [...]}.')
+            sys.exit(2)
+        bad = [x for x in ids if x.strip() and not _task_re.fullmatch(x.strip())]
+        if bad:
+            print(f"ОШИБКА: не похожи на Jira ID: {bad} (маска PROJECT-123).")
+            sys.exit(2)
+        _cfg.UNAPPROVED_JIRA_IDS = {x.strip() for x in ids if x.strip()}
+        logger.info("Неутверждённые задачи (эмуляция RAG): %d id из %s",
+                    len(_cfg.UNAPPROVED_JIRA_IDS), unapproved_path)
 
     # Переопределяем политику удаления истории на время процесса (вариант A).
     # remove_history_sections() читает app.config.REMOVE_HISTORY_SECTIONS динамически.
@@ -719,9 +814,14 @@ def main():
                 "СОХРАНЯТЬ раздел истории" if keep_history else "удалять раздел истории")
     logger.info("Images mode: %s",
                 "СКАЧИВАТЬ картинки в img/" if with_images else "картинки игнорируются")
-    logger.info("Strikethrough mode: %s",
-                "ИСКЛЮЧАТЬ зачёркнутый текст (при любом раскладе)" if drop_strikethrough
-                else "по умолчанию (зачёркнутое — как обычно)")
+    if drop_strikethrough and critic:
+        strike_mode = ("ИСКЛЮЧАТЬ только ЧЁРНОЕ зачёркнутое; цветное сохраняется "
+                       "маркерами {--…--} (им управляет critic)")
+    elif drop_strikethrough:
+        strike_mode = "ИСКЛЮЧАТЬ зачёркнутый текст (при любом раскладе)"
+    else:
+        strike_mode = "по умолчанию (зачёркнутое — как обычно)"
+    logger.info("Strikethrough mode: %s", strike_mode)
     logger.info("Index mode: %s",
                 "генерировать index.md по папкам" if with_index else "без index.md")
     logger.info("")

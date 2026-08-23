@@ -506,12 +506,93 @@ def _write_text_preserving(path: Path, text: str) -> None:
         f.write(text)
 
 
+# --------------------------------------------------------------------------------------
+# Страничный флаг неутверждённого состава (frontmatter `unapproved_jira`).
+#
+# Зачем. Форс-обёртка (unapproved_wrap) помечает состав новой страницы вставками
+# задачи, но fenced-код обернуть не может: маркер «через забор» нотацией не
+# читается (process_text отдаёт код-регионы байт-в-байт). Из-за этого reject-all
+# оставлял на странице блоки кода из макросов Confluence, и очистка была неполной
+# (инцидент 2026-08-23: КриптоМодуль_PostMessage — 86 % тела снято маркерами,
+# два блока ``` остались).
+#
+# Решение — страничное, а не пофрагментное: миграция пишет во frontmatter
+# `unapproved_jira: <ID>` (страницы нет в ПРОМ целиком), а здесь reject этой
+# задачи опустошает тело файла, не полагаясь на маркеры вовсе. apply снимает
+# флаг: состав принят, страница становится обычной.
+# --------------------------------------------------------------------------------------
+
+# Поле frontmatter со ссылкой на задачу, которой принадлежит ВЕСЬ состав страницы.
+UNAPPROVED_PAGE_KEY = "unapproved_jira"
+
+# Frontmatter-блок в начале файла (перевод строки любой — CRLF сохраняется).
+_FRONTMATTER_RE = re.compile(r"\A---[ \t]*\r?\n.*?\r?\n---[ \t]*\r?\n", re.DOTALL)
+
+_UNAPPROVED_LINE_RE = re.compile(
+    r"^" + UNAPPROVED_PAGE_KEY + r":[ \t]*['\"]?(" + TASK_ID_PATTERN + r")['\"]?[ \t]*\r?\n",
+    re.MULTILINE,
+)
+
+# Любой остаток critic-разметки в теле: чужие вставки терять нельзя (см. ниже).
+_ANY_CRITIC_LEFT_RE = re.compile(r"\{\+\+|\{--|\{~~|class=\"critic-")
+
+
+def read_page_unapproved(text: str) -> Optional[str]:
+    """ID задачи из frontmatter-поля `unapproved_jira`, иначе None."""
+    fm = _FRONTMATTER_RE.match(text)
+    if not fm:
+        return None
+    m = _UNAPPROVED_LINE_RE.search(fm.group(0))
+    return m.group(1) if m else None
+
+
+def apply_page_flag(text: str, op: str, task_id: Optional[str]) -> Tuple[str, int]:
+    """
+    Обработать страничный флаг: reject опустошает тело, apply снимает флаг.
+
+    Возвращает (новый_текст, число_правок). Правок 0 — файл не трогаем.
+
+    Осторожность с чужим составом: если после разбора маркеров в теле остались
+    вставки ДРУГИХ задач, тело не опустошается. Страничный флаг говорит «этой
+    страницы нет в ПРОМ», но молча удалять чужие пометки он не вправе — такой
+    случай остаётся оператору.
+    """
+    flag = read_page_unapproved(text)
+    if not flag:
+        return text, 0
+    if task_id is not None and task_id != flag:
+        return text, 0          # флаг чужой задачи — не наше дело
+
+    fm_block = _FRONTMATTER_RE.match(text).group(0)
+    body = text[len(fm_block):]
+
+    if op == "apply":
+        new_fm = _UNAPPROVED_LINE_RE.sub("", fm_block, count=1)
+        return (new_fm + body, 1) if new_fm != fm_block else (text, 0)
+
+    if op == "reject":
+        if not body.strip():
+            return text, 0      # уже пусто — идемпотентность (ТЗ п. 5.3)
+        if _ANY_CRITIC_LEFT_RE.search(body):
+            return text, 0      # чужой состав — решает оператор
+        eol = "\r\n" if "\r\n" in fm_block else "\n"
+        return fm_block + eol, 1
+
+    return text, 0
+
+
 def process_file(path: Path, op: str, task_id: Optional[str],
                  status_column: str = STATUS_COLUMN,
                  dry_run: bool = False) -> int:
     """Обрабатывает один .md файл. Возвращает число правок. Не пишет неизменённый файл."""
     original = _read_text_preserving(path)
     new_text, count = process_text(original, op, task_id, status_column, path)
+    # Страничный флаг — ПОСЛЕ разбора маркеров: reject доводит очистку до конца
+    # там, где нотация бессильна (fenced-код макросов), apply снимает отработавший
+    # флаг. Порядок важен: сначала снимаются чужие маркеры, потом решается судьба
+    # остатка страницы.
+    new_text, page_count = apply_page_flag(new_text, op, task_id)
+    count += page_count
     if count == 0 or new_text == original:
         return 0  # идемпотентность: без изменений файл не трогаем (ТЗ п. 5.3)
     if not dry_run:
@@ -965,6 +1046,15 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: Optional[List[str]] = None) -> int:
+    # Версия при старте (в stderr — не мешает перенаправлению вывода команд).
+    # Импорт мягкий: модуль автономен (stdlib + bs4) и обязан работать даже
+    # вне пакета app (например, скопированный отдельно).
+    try:
+        from app.version import banner
+        print(f"# {banner('critic')}", file=sys.stderr)
+    except ImportError:
+        pass
+
     args = build_parser().parse_args(argv)
     root = Path(args.path)
     if not root.exists():
