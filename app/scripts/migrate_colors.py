@@ -84,11 +84,17 @@ def accumulate_page(acc: dict, name: str, result, survey: dict) -> None:
             confidence = result.confidence.get(color, "high")
 
         entry = acc["tasks"].setdefault(
-            task_id, {"color": color, "confidence": confidence, "pages": set(), "markers": 0})
+            task_id, {"color": color, "confidence": confidence, "pages": set(),
+                      "markers": 0, "date": None})
         entry["pages"].add(name)
         entry["markers"] += cnt
         if confidence == "low":  # коллизия приоритетнее 'high'
             entry["confidence"] = "low"
+        # Самая ранняя дата записи истории по задаче — min по всем страницам
+        # прогона (предложение порядка вливания, 2026-08-10)
+        d = result.task_dates.get(task_id)
+        if d and (entry["date"] is None or d < entry["date"]):
+            entry["date"] = d
 
 
 def finalize(acc: dict, service: str, migrated_at: str) -> Tuple[dict, dict]:
@@ -96,11 +102,23 @@ def finalize(acc: dict, service: str, migrated_at: str) -> Tuple[dict, dict]:
     manifest_tasks = {}
     for task_id in sorted(acc["tasks"]):
         e = acc["tasks"][task_id]
+        d = e.get("date")
         manifest_tasks[task_id] = {
             "color": e["color"], "confidence": e["confidence"],
             "pages": sorted(e["pages"]), "markers": e["markers"],
+            "first_seen": f"{d[0]:04d}-{d[1]:02d}-{d[2]:02d}" if d else None,
         }
     manifest = {"migrated_at": migrated_at, "service": service, "tasks": manifest_tasks}
+
+    # Предложение порядка вливания (apply) на внешнем контуре: по самой
+    # ранней дате записи истории; задачи без даты — в конец (руками).
+    # Стабильность при равных датах — по id.
+    apply_order = sorted(
+        ({"task": t, "first_seen": manifest_tasks[t]["first_seen"],
+          "pages": manifest_tasks[t]["pages"],
+          "confidence": manifest_tasks[t]["confidence"]}
+         for t in manifest_tasks),
+        key=lambda x: (x["first_seen"] is None, x["first_seen"] or "", x["task"]))
 
     positions = (len(acc["unresolved_placeholders"]) + len(acc["collisions"])
                  + len(acc["jira_unextractable"]) + len(acc["nested"]))
@@ -120,6 +138,7 @@ def finalize(acc: dict, service: str, migrated_at: str) -> Tuple[dict, dict]:
         "nested_flattened": acc["nested"],
         "color_summary": sorted(acc["color_summary"],
                                 key=lambda c: (c["color"], -c["count"], c["page"])),
+        "apply_order": apply_order,
     }
     return manifest, report
 
@@ -180,7 +199,8 @@ def migrate_pages(pages, service, migrated_at, out_dir):
 
 
 def write_reports(out_dir: Path, manifest: dict, report: dict) -> None:
-    """Записывает manifest.yaml + report.json + report.md в каталог (единый писатель)."""
+    """Записывает manifest.yaml + report.json + report.md + apply-order.md
+    в каталог (единый писатель)."""
     out_dir.mkdir(parents=True, exist_ok=True)
     (out_dir / "migration-manifest.yaml").write_text(
         yaml.safe_dump(manifest, allow_unicode=True, sort_keys=False), encoding="utf-8")
@@ -188,6 +208,64 @@ def write_reports(out_dir: Path, manifest: dict, report: dict) -> None:
         json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
     (out_dir / "migration-colors-report.md").write_text(
         render_report_md(report), encoding="utf-8")
+    (out_dir / "migration-apply-order.md").write_text(
+        render_apply_order_md(report), encoding="utf-8")
+
+
+def render_apply_order_md(report: dict) -> str:
+    """Предложение порядка вливания задач на внешнем контуре (2026-08-10).
+
+    Дата — самая ранняя запись «Истории изменений» с этой задачей по всем
+    страницам прогона: она характеризует момент появления задачи и потому
+    задаёт естественный порядок apply. Это ПРЕДЛОЖЕНИЕ, а не команда:
+    задачи одного дня помечаются (их взаимный порядок неопределён — даты
+    в истории без времени), задачи без распознанной даты — отдельной
+    секцией в конце, их место определяет аналитик."""
+    order = report.get("apply_order", [])
+    dated = [o for o in order if o["first_seen"]]
+    undated = [o for o in order if not o["first_seen"]]
+
+    lines: List[str] = []
+    lines.append(f"# Порядок вливания задач (предложение) — сервис {report['service']}")
+    lines.append("")
+    lines.append(f"Дата формирования: {report['migrated_at']}")
+    lines.append("")
+    lines.append("Дата задачи — самая ранняя запись «Истории изменений» с её id по всем "
+                 "страницам прогона. Задачи одного дня помечены: их взаимный порядок "
+                 "по датам не определить (в истории нет времени) — уточните по Jira, "
+                 "если задачи трогают одни и те же требования.")
+    lines.append("")
+    lines.append("| № | Задача | Первая запись | Confidence | Страницы |")
+    lines.append("| --- | --- | --- | --- | --- |")
+    by_date: Dict[str, int] = {}
+    for o in dated:
+        by_date[o["first_seen"]] = by_date.get(o["first_seen"], 0) + 1
+    for i, o in enumerate(dated, 1):
+        mark = " ⚠ один день" if by_date[o["first_seen"]] > 1 else ""
+        lines.append(f"| {i} | {o['task']} | {o['first_seen']}{mark} | "
+                     f"{o['confidence']} | {'; '.join(o['pages'][:3])} |")
+    if not dated:
+        lines.append("| — | _нет задач с распознанной датой_ | | | |")
+    lines.append("")
+
+    if undated:
+        lines.append(f"## Без распознанной даты ({len(undated)}) — место в порядке "
+                     f"определите вручную")
+        lines.append("")
+        for o in undated:
+            lines.append(f"- {o['task']} ({o['confidence']}; {'; '.join(o['pages'][:3])})")
+        lines.append("")
+
+    lines.append("## Команды (в предложенном порядке)")
+    lines.append("")
+    lines.append("```")
+    for o in dated:
+        lines.append(f"run-critic.bat apply {o['task']} --path .")
+    for o in undated:
+        lines.append(f"REM порядок уточните: run-critic.bat apply {o['task']} --path .")
+    lines.append("```")
+    lines.append("")
+    return "\n".join(lines)
 
 
 def render_report_md(report: dict) -> str:

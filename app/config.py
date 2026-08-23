@@ -240,3 +240,12 @@ LEGACY_EMBEDDING_MODEL = os.getenv("LEGACY_EMBEDDING_MODEL", "sentence-transform
 MV_TITLE_WEIGHT = float(os.getenv("MV_TITLE_WEIGHT", "0.7"))
 MV_SUMMARY_WEIGHT = float(os.getenv("MV_SUMMARY_WEIGHT", "0.25"))
 MV_CONTENT_WEIGHT = float(os.getenv("MV_CONTENT_WEIGHT", "0.05"))
+# ============================================================================
+# ЭМУЛЯЦИЯ ПОХОДА В RAG: НЕУТВЕРЖДЁННЫЕ ЗАДАЧИ (2026-08-07)
+# ============================================================================
+# «Чёрное = ПРОМ» неверно для новых страниц: весь состав чёрный с рождения.
+# Список Jira ID неутверждённых задач (ключ --unapproved-jira <file.json>
+# у migrate_confluence_tree): джира из ЧЁРНОЙ строки истории входит в список →
+# состав страницы неутверждён. Пустое множество (по умолчанию) — поведение
+# конвейера не меняется ни на байт.
+UNAPPROVED_JIRA_IDS: set = set()

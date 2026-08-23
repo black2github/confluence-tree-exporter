@@ -11,6 +11,10 @@ REM    run-tree.bat 12345 CORP_CARDS лимиты --all --http --with-images
 REM    run-tree.bat 12345 CORP_CARDS лимиты --http --with-images
 REM
 REM  Флаги: --http --all/--tasks --keep-history --with-images --with-index --drop-strikethrough
+REM         --unapproved-jira <file.json> — список Jira ID неутверждённых задач:
+REM         джира из ЧЁРНОЙ строки истории входит в список -> состав страницы
+REM         не утверждён (--tasks: обёртка вставками; approved: пропуск; --all: draft)
+REM  Пример: run-tree.bat 12345 CORP_CARDS лимиты --tasks --unapproved-jira unapproved.json
 REM ============================================================================
 setlocal
 cd /d "%~dp0"

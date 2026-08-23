@@ -866,6 +866,24 @@ class ContentExtractor:
             return True
         return element.find(["s", "del", "strike"]) is not None
 
+    def _strike_belongs_to_task(self, element: Tag) -> bool:
+        """Зачёркнутое относится к правке ЗАДАЧИ (цветное) — выкидывать нельзя:
+        фрагмент станет {--ID: …--} и им управляет critic (apply/reject).
+
+        Цвет ищется у самого элемента, у предков (типовой паттерн: цветной span
+        снаружи, <s> внутри) и у потомков (обратный паттерн: <s> снаружи,
+        цветной span внутри). Ограничитель удаляющей эвристики (Д-22):
+        сомнение трактуется в пользу сохранения."""
+        cur = element
+        while isinstance(cur, Tag):
+            if self._is_edit_color(self._element_own_color(cur)):
+                return True
+            cur = cur.parent
+        for child in element.find_all(True):
+            if self._is_edit_color(self._element_own_color(child)):
+                return True
+        return False
+
     def _is_edit_color(self, color: Optional[str]) -> bool:
         """Является ли цвет РЕАЛЬНОЙ правкой требования (порядок проверок ТЗ п. 4.3.2).
 
@@ -1397,11 +1415,19 @@ class ContentExtractor:
         # Зачёркнутый текст.
         # • exclude_strikethrough=True (флаг --drop-strikethrough) — выкидываем ВСЕГДА,
         #   даже под --all: сам факт вычеркивания = запланированное удаление фрагмента.
+        #   ИСКЛЮЧЕНИЕ — критик-режим (2026-08-07): цветное зачёркнутое — это удаление
+        #   ЗАДАЧЕЙ, оно обязано стать {--ID: …--} (им управляет critic: apply применяет,
+        #   reject-all возвращает ПРОМ-состав); выкидывание на выгрузке сделало бы
+        #   восстановление невозможным. Флаг в критик-режиме действует только на
+        #   ЧЁРНОЕ зачёркнутое (применённый мусор ПРОМ) — ровно то, что approved-режим
+        #   выкидывает этим же флагом.
         # • Иначе в approved-режиме выкидываем, под --all (include_colored) сохраняем
         #   как обычный текст (вычеркивание без цвета/контекста само по себе ценности
         #   не несёт, а текст требования нужен).
         if element.name == "s":
             if self.config.exclude_strikethrough:
+                if self.config.critic_mode and self._strike_belongs_to_task(element):
+                    return False
                 return True
             return not self.config.include_colored
 
@@ -2546,14 +2572,16 @@ def create_critic_extractor(color_map: Dict[str, str]) -> ContentExtractor:
 
     Цветные фрагменты оборачиваются в маркеры по карте color_map (нормализованный
     #rrggbb -> TASK-ID). Режим подразумевает include_colored=True — ничего не выбрасываем,
-    всё оборачиваем; зачёркивание в этом режиме НЕ выкидывается (становится {--...--}).
+    всё оборачиваем; ЦВЕТНОЕ зачёркивание не выкидывается никогда (становится {--...--}).
+    Флаг --drop-strikethrough в этом режиме действует только на ЧЁРНОЕ зачёркнутое
+    (см. _is_ignored_element, 2026-08-07).
     """
     config = ExtractionConfig(
         include_colored=True,
         preserve_whitespace=True,
         normalize_spacing=False,
         migrate_images=_migrate_images_enabled(),
-        exclude_strikethrough=False,
+        exclude_strikethrough=_exclude_strikethrough_enabled(),
         critic_mode=True,
         color_map=color_map,
     )

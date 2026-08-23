@@ -61,6 +61,11 @@ class HistoryMapResult:
     """Результат разбора истории одной страницы (ТЗ п. 4.2)."""
     color_to_task: Dict[str, str] = field(default_factory=dict)   # #rrggbb -> TASK-ID
     confidence: Dict[str, str] = field(default_factory=dict)      # #rrggbb -> 'high'|'low'
+    # TASK-ID -> самая РАННЯЯ дата записи истории с этой задачей (г, м, д).
+    # Порядок вливания на внешнем контуре (2026-08-10): первая по времени
+    # запись характеризует момент появления задачи — по ней строится
+    # предложение порядка apply в отчёте migration-apply-order.md.
+    task_dates: Dict[str, Tuple[int, int, int]] = field(default_factory=dict)
     collisions: List[dict] = field(default_factory=list)          # цвет → несколько задач
     unresolved_jira: List[dict] = field(default_factory=list)     # цвет есть, id не извлечён
     multi_id_rows: List[dict] = field(default_factory=list)       # серия задач одного цвета
@@ -249,6 +254,76 @@ def survey_body_colors(raw_html: str, result: "HistoryMapResult") -> Dict[str, d
     return summary
 
 
+@dataclass
+class ForcedUnapproved:
+    """Страница признана неутверждённой по списку задач (эмуляция похода в RAG).
+
+    Чёрная строка истории обычно означает «задача на ПРОМ», но для НОВОЙ страницы
+    весь состав чёрный с рождения. Внешнее знание — JSON-список неутверждённых
+    Jira ID: если джира из ЧЁРНОЙ строки истории входит в список, состав страницы
+    считается неутверждённым и метится этой джирой (решение пользователя,
+    2026-08-07; риски забывчивости/чужих страниц приняты)."""
+    task: str                                   # джира, которой метится состав
+    candidates: List[str] = field(default_factory=list)   # все совпавшие джиры
+    warnings: List[str] = field(default_factory=list)
+    # самая ранняя дата записи истории с выбранной задачей — для предложения
+    # порядка вливания (migration-apply-order.md, 2026-08-10)
+    first_seen: Optional[Tuple[int, int, int]] = None
+
+
+def find_forced_unapproved(raw_html: str, unapproved_ids) -> Optional[ForcedUnapproved]:
+    """Джиры ЧЁРНЫХ строк истории ∈ списку неутверждённых → форс-режим страницы.
+
+    Возвращает ForcedUnapproved или None (страница живёт по обычным правилам).
+    При нескольких совпавших джирах берётся строка с самой поздней датой —
+    симметрично разрешению коллизий цветов (ТЗ п. 4.2.е), с предупреждением.
+    Страницы без опознанной истории не покрываются (риск принят: команды чистят
+    страницы к переезду)."""
+    unapproved = {u.strip() for u in unapproved_ids if u and u.strip()}
+    if not unapproved:
+        return None
+
+    soup = BeautifulSoup(raw_html, "html.parser")
+    table = find_history_table(soup)
+    if table is None:
+        return None
+    roles, header_row = _identify_columns(table)
+    if "description" not in roles or "jira" not in roles:
+        return None
+
+    di, ji = roles["description"], roles["jira"]
+    dti = roles.get("date")
+
+    matched: List[Tuple[str, Optional[Tuple[int, int, int]]]] = []
+    for row in table.find_all("tr"):
+        if row is header_row:
+            continue
+        cells = row.find_all(["th", "td"], recursive=False)
+        if max(di, ji, dti if dti is not None else 0) >= len(cells):
+            continue
+        if _extract_row_colors(cells[di]):
+            continue          # цветная строка — обрабатывается картой цветов
+        date = _extract_date(cells[dti]) if dti is not None else None
+        for task_id in _resolve_jira_ids(cells[ji]):
+            if task_id in unapproved:
+                matched.append((task_id, date))
+
+    if not matched:
+        return None
+
+    matched.sort(key=lambda m: m[1] or (0, 0, 0))
+    chosen = matched[-1][0]
+    distinct = sorted({t for t, _d in matched})
+    chosen_dates = [d for t, d in matched if t == chosen and d]
+    result = ForcedUnapproved(task=chosen, candidates=distinct,
+                              first_seen=min(chosen_dates) if chosen_dates else None)
+    if len(distinct) > 1:
+        result.warnings.append(
+            f"несколько неутверждённых задач в чёрных строках истории {distinct} — "
+            f"состав помечен последней по дате: {chosen}")
+    return result
+
+
 def build_color_task_map(raw_html: str) -> HistoryMapResult:
     """Строит карту «цвет → задача» из истории изменений страницы (ТЗ п. 4.2).
 
@@ -285,6 +360,14 @@ def build_color_task_map(raw_html: str) -> HistoryMapResult:
         ids = _resolve_jira_ids(cells[ji])
         date = _extract_date(cells[dti]) if dti is not None else None
         rows_info.append(RowInfo(colors=colors, task_ids=ids, date=date, raw_html=str(row)))
+        # Дата первой записи по задаче: min по всем строкам с этим id (дубли
+        # легальны — одна задача правит страницу в разные даты). Дата строки
+        # относится ко ВСЕМ id серии (несколько задач в одной ячейке).
+        if date:
+            for tid in ids:
+                cur = result.task_dates.get(tid)
+                if cur is None or date < cur:
+                    result.task_dates[tid] = date
         if len(ids) > 1:
             result.multi_id_rows.append({"colors": colors, "task_ids": ids})
             result.warnings.append(
