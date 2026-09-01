@@ -1,19 +1,18 @@
 @echo off
-chcp 65001 >nul
 REM ============================================================================
-REM  ╨Т╤Л╨│╤А╤Г╨╖╨║╨░ ╨Ю╨Ф╨Э╨Ю╨Щ ╤Б╤В╤А╨░╨╜╨╕╤Ж╤Л Confluence ╨▓ markdown.
+REM  Выгрузка ОДНОЙ страницы Confluence в markdown.
 REM
-REM  ╨Ш╤Б╨┐╨╛╨╗╤М╨╖╨╛╨▓╨░╨╜╨╕╨╡:
-REM    run-page.bat <page_id> <service_code> <subdir> [source] [╤Д╨╗╨░╨│╨╕]
-REM  ╨Я╤А╨╕╨╝╨╡╤А:
-REM    run-page.bat 12345 CORP_CARDS ╨╗╨╕╨╝╨╕╤В╤Л
+REM  Использование:
+REM    run-page.bat <page_id> <service_code> <subdir> [source] [флаги]
+REM  Пример:
+REM    run-page.bat 12345 CORP_CARDS лимиты
 REM
-REM  ╨д╨╗╨░╨│╨╕: --http --all --keep-history --with-images --drop-strikethrough
+REM  Флаги: --http --all --keep-history --with-images --drop-strikethrough
 REM ============================================================================
 setlocal
 cd /d "%~dp0"
 if not exist ".venv\Scripts\python.exe" (
-    echo ╨Ю╨и╨Ш╨С╨Ъ╨Р: ╨╛╨║╤А╤Г╨╢╨╡╨╜╨╕╨╡ ╨╜╨╡ ╤Г╤Б╤В╨░╨╜╨╛╨▓╨╗╨╡╨╜╨╛. ╨б╨╜╨░╤З╨░╨╗╨░ ╨╖╨░╨┐╤Г╤Б╤В╨╕╤В╨╡ install.bat
+    echo ОШИБКА: окружение не установлено. Сначала запустите install.bat
     exit /b 1
 )
 set "PYTHONPATH=%~dp0"

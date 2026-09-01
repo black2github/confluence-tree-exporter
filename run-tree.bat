@@ -1,26 +1,25 @@
 @echo off
-chcp 65001 >nul
 REM ============================================================================
-REM  ╨Т╤Л╨│╤А╤Г╨╖╨║╨░ ╨Ф╨Х╨а╨Х╨Т╨Р ╤Б╤В╤А╨░╨╜╨╕╤Ж Confluence ╨▓ markdown.
-REM  ╨а╨╡╨╖╤Г╨╗╤М╤В╨░╤В ╨┐╨╕╤И╨╡╤В╤Б╤П ╨▓ ╨┐╨╛╨┤╨║╨░╤В╨░╨╗╨╛╨│ conf-requirements\<service>\<subdir>\
+REM  Выгрузка ДЕРЕВА страниц Confluence в markdown.
+REM  Результат пишется в подкаталог conf-requirements\<service>\<subdir>\
 REM
-REM  ╨Ш╤Б╨┐╨╛╨╗╤М╨╖╨╛╨▓╨░╨╜╨╕╨╡:
-REM    run-tree.bat <page_id> <service_code> <subdir> [source] [╤Д╨╗╨░╨│╨╕]
-REM  ╨Я╤А╨╕╨╝╨╡╤А:
-REM    run-tree.bat 12345 CORP_CARDS ╨╗╨╕╨╝╨╕╤В╤Л DBOCORPESPLN --tasks
-REM    run-tree.bat 12345 CORP_CARDS ╨╗╨╕╨╝╨╕╤В╤Л --all --http --with-images
-REM    run-tree.bat 12345 CORP_CARDS ╨╗╨╕╨╝╨╕╤В╤Л --http --with-images
+REM  Использование:
+REM    run-tree.bat <page_id> <service_code> <subdir> [source] [флаги]
+REM  Пример:
+REM    run-tree.bat 12345 CORP_CARDS лимиты DBOCORPESPLN --tasks
+REM    run-tree.bat 12345 CORP_CARDS лимиты --all --http --with-images
+REM    run-tree.bat 12345 CORP_CARDS лимиты --http --with-images
 REM
-REM  ╨д╨╗╨░╨│╨╕: --http --all/--tasks --keep-history --with-images --with-index --drop-strikethrough
-REM         --unapproved-jira <file.json> тАФ ╤Б╨┐╨╕╤Б╨╛╨║ Jira ID ╨╜╨╡╤Г╤В╨▓╨╡╤А╨╢╨┤╤С╨╜╨╜╤Л╤Е ╨╖╨░╨┤╨░╤З:
-REM         ╨┤╨╢╨╕╤А╨░ ╨╕╨╖ ╨з╨Б╨а╨Э╨Ю╨Щ ╤Б╤В╤А╨╛╨║╨╕ ╨╕╤Б╤В╨╛╤А╨╕╨╕ ╨▓╤Е╨╛╨┤╨╕╤В ╨▓ ╤Б╨┐╨╕╤Б╨╛╨║ -> ╤Б╨╛╤Б╤В╨░╨▓ ╤Б╤В╤А╨░╨╜╨╕╤Ж╤Л
-REM         ╨╜╨╡ ╤Г╤В╨▓╨╡╤А╨╢╨┤╤С╨╜ (--tasks: ╨╛╨▒╤С╤А╤В╨║╨░ ╨▓╤Б╤В╨░╨▓╨║╨░╨╝╨╕; approved: ╨┐╤А╨╛╨┐╤Г╤Б╨║; --all: draft)
-REM  ╨Я╤А╨╕╨╝╨╡╤А: run-tree.bat 12345 CORP_CARDS ╨╗╨╕╨╝╨╕╤В╤Л --tasks --unapproved-jira unapproved.json
+REM  Флаги: --http --all/--tasks --keep-history --with-images --with-index --drop-strikethrough
+REM         --unapproved-jira <file.json> - список Jira ID неутверждённых задач:
+REM         джира из ЧЁРНОЙ строки истории входит в список -> состав страницы
+REM         не утверждён (--tasks: обёртка вставками; approved: пропуск; --all: draft)
+REM  Пример: run-tree.bat 12345 CORP_CARDS лимиты --tasks --unapproved-jira unapproved.json
 REM ============================================================================
 setlocal
 cd /d "%~dp0"
 if not exist ".venv\Scripts\python.exe" (
-    echo ╨Ю╨и╨Ш╨С╨Ъ╨Р: ╨╛╨║╤А╤Г╨╢╨╡╨╜╨╕╨╡ ╨╜╨╡ ╤Г╤Б╤В╨░╨╜╨╛╨▓╨╗╨╡╨╜╨╛. ╨б╨╜╨░╤З╨░╨╗╨░ ╨╖╨░╨┐╤Г╤Б╤В╨╕╤В╨╡ install.bat
+    echo ОШИБКА: окружение не установлено. Сначала запустите install.bat
     exit /b 1
 )
 set "PYTHONPATH=%~dp0"
