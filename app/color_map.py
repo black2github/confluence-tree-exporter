@@ -144,12 +144,36 @@ def _extract_row_colors(cell: Tag) -> List[str]:
     return colors
 
 
+def _order_by_first_mention(cell: Tag, ids: List[str]) -> List[str]:
+    """Упорядочить id по первому упоминанию в ТЕКСТЕ ячейки (решение владельца
+    2026-09-02).
+
+    Первый в списке становится задачей цвета, поэтому порядок — не формальность.
+    Раньше он задавался порядком ссылок в разметке, а это не совпадает с тем, что
+    видит и пишет автор: в разобранной ячейке ключ TEAMECO-5354 стоял ПЕРВЫМ
+    обычным текстом, а первой ссылкой шёл другой ключ — победителем оказывался он.
+    Теперь считаем по видимому тексту: чей ключ автор упомянул раньше, тот и берётся.
+
+    Id, которого в тексте нет вовсе (например, только в href), уходит в конец с
+    сохранением исходного порядка — терять его нельзя, но и первенства он не даёт.
+    """
+    text = cell.get_text(" ", strip=True)
+    positions = []
+    for order, task_id in enumerate(ids):
+        pos = text.find(task_id)
+        positions.append(((pos < 0), pos if pos >= 0 else 0, order, task_id))
+    return [t for _absent, _pos, _order, t in sorted(positions)]
+
+
 def _resolve_jira_ids(cell: Tag) -> List[str]:
     """Цепочка резолверов id задачи из ячейки «Задача в Jira» (ТЗ п. 4.2.г).
 
     Порядок: макрос-с-ключом (storage) → data-macro-parameters → ссылка browse/ →
     plain-text по маске. Первый сработавший способ и даёт результат (может вернуть
     несколько id — серия задач одного цвета). Пустой список = id извлечь не удалось.
+
+    Несколько id упорядочиваются по первому упоминанию в тексте ячейки
+    (_order_by_first_mention): первый из них становится задачей цвета.
     """
     # 1. Storage-формат: <ac:structured-macro ac:name="jira"><ac:parameter ac:name="key">KEY
     for macro in cell.find_all("ac:structured-macro"):
@@ -174,14 +198,14 @@ def _resolve_jira_ids(cell: Tag) -> List[str]:
         if m and m.group(1) not in hrefs:
             hrefs.append(m.group(1))
     if hrefs:
-        return hrefs
+        return _order_by_first_mention(cell, hrefs)
 
     # 4. Финальный fallback — маска по тексту ячейки.
     ids: List[str] = []
     for m in TASK_ID_RE.finditer(cell.get_text(" ", strip=True)):
         if m.group(0) not in ids:
             ids.append(m.group(0))
-    return ids
+    return ids   # уже в порядке появления в тексте
 
 
 def _extract_date(cell: Optional[Tag]) -> Optional[Tuple[int, int, int]]:
