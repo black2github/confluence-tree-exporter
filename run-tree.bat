@@ -1,4 +1,5 @@
 @echo off
+chcp 65001 >nul
 REM ============================================================================
 REM  Выгрузка ДЕРЕВА страниц Confluence в markdown.
 REM  Результат пишется в подкаталог conf-requirements\<service>\<subdir>\

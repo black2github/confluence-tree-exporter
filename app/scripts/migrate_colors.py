@@ -37,6 +37,7 @@ def new_accumulator() -> dict:
         "pages_without_history": [],
         "collisions": [],
         "jira_unextractable": [],
+        "multi_task_rows": [],        # несколько задач в одной строке истории (4.2.г)
         "unresolved_placeholders": [],
         "nested": [],                 # уплощённые вложенности (ТЗ 4.5) — заполняет вызывающий
         "tasks": {},                  # task_id -> {color, confidence, pages:set, markers}
@@ -59,6 +60,20 @@ def accumulate_page(acc: dict, name: str, result, survey: dict) -> None:
         acc["collisions"].append({"page": name, **col})
     for u in result.unresolved_jira:
         acc["jira_unextractable"].append({"page": name, "color": u["color"]})
+    # Несколько задач в одной ячейке «Задача в Jira»: карта устроена «цвет → ОДНА
+    # задача», поэтому в маркеры идёт первый id, остальные молча выпадали из отчёта
+    # (инцидент 2026-09-02: TEAMECO-5354 рядом с DBOCORPESPLN-59857 на одном цвете).
+    # Порядок id определяется порядком ссылок в HTML, то есть выбор победителя
+    # случаен по сути — аналитик обязан это видеть.
+    for row in getattr(result, "multi_id_rows", []):
+        ids = row.get("task_ids") or []
+        for color in row.get("colors") or []:
+            acc["multi_task_rows"].append({
+                "page": name, "color": color,
+                "chosen": ids[0] if ids else None,
+                "dropped": ids[1:],
+                "task_ids": ids,
+            })
 
     for color, info in survey.items():
         cls, cnt = info["classification"], info["count"]
@@ -121,7 +136,8 @@ def finalize(acc: dict, service: str, migrated_at: str) -> Tuple[dict, dict]:
         key=lambda x: (x["first_seen"] is None, x["first_seen"] or "", x["task"]))
 
     positions = (len(acc["unresolved_placeholders"]) + len(acc["collisions"])
-                 + len(acc["jira_unextractable"]) + len(acc["nested"]))
+                 + len(acc["jira_unextractable"]) + len(acc["nested"])
+                 + len(acc["multi_task_rows"]))
     report = {
         "migrated_at": migrated_at,
         "service": service,
@@ -135,6 +151,7 @@ def finalize(acc: dict, service: str, migrated_at: str) -> Tuple[dict, dict]:
         "unresolved_placeholders": acc["unresolved_placeholders"],
         "collisions": acc["collisions"],
         "jira_unextractable": acc["jira_unextractable"],
+        "multi_task_rows": acc["multi_task_rows"],
         "nested_flattened": acc["nested"],
         "color_summary": sorted(acc["color_summary"],
                                 key=lambda c: (c["color"], -c["count"], c["page"])),
@@ -305,6 +322,12 @@ def render_report_md(report: dict) -> str:
     _section("Ячейки «Задача в Jira» без извлекаемого id",
              [f"- {to_rgb_notation(j['color']) or ''} ({j['color']}) на «{j['page']}»"
               for j in report["jira_unextractable"]])
+    # Карта устроена «цвет → ОДНА задача»: остальные id строки в маркеры не попадают.
+    _section("Несколько задач в одной строке истории — в маркеры взят один",
+             [f"- {to_rgb_notation(m['color']) or ''} ({m['color']}) на «{m['page']}»: "
+              f"взят {m['chosen']}, НЕ отражены {m['dropped']} "
+              f"(порядок определяется порядком ссылок в HTML)"
+              for m in report.get("multi_task_rows", [])])
     nested = report.get("nested_flattened", [])
     _by_conf = lambda c: [f"- задачи {n['tasks']} на «{n['page']}»"
                           for n in nested if n.get("confidence") == c]
