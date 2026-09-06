@@ -604,5 +604,11 @@
     "key": "SG",
     "name": "АС СБП",
     "platform": false
+  },
+  {
+    "code": "fileManager2",
+    "key": "FM2",
+    "name": "[Файловый сервис] Сервис по работе с файлами 2",
+    "platform": true
   }
 ]

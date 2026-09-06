@@ -18,7 +18,14 @@
 import hashlib
 from pathlib import Path
 
-VERSION = "1.6.2"
+VERSION = "1.7.0"
+
+# Коммит канона, из которого собрана поставка: подставляется сборщиком
+# (app/scripts/build_bundle.py) при раскладке бандла. В самом каноне пусто — это
+# дерево разработки, а не поставка. Отпечаток исходников отвечает на вопрос
+# «одинаковы ли две копии пакета», штамп — на вопрос «из чего пакет собран»:
+# деревья канона и поставки разного состава, их отпечатки несравнимы.
+BUILD_FROM = "fbafd040"
 
 
 def source_fingerprint() -> str:
@@ -38,4 +45,5 @@ def source_fingerprint() -> str:
 
 def banner(tool: str) -> str:
     """Строка версии для печати при старте утилиты."""
-    return f"{tool}: версия {VERSION}, отпечаток исходников {source_fingerprint()}"
+    line = f"{tool}: версия {VERSION}, отпечаток исходников {source_fingerprint()}"
+    return f"{line}, из канона {BUILD_FROM}" if BUILD_FROM else line
