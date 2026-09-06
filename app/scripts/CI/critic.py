@@ -438,6 +438,19 @@ def _has_class(tag, name: str) -> bool:
     return bool(cls) and name in cls
 
 
+def _is_destroyed(tag) -> bool:
+    """Элемент уже уничтожен вместе с родителем (BeautifulSoup.decompose).
+
+    Список элементов собирается до мутаций, а строки в выгрузках Confluence бывают
+    вложены друг в друга (таблица внутри ячейки; html.parser вложенность не
+    расправляет). Удаление внешней critic-строки уничтожает и внутреннюю, которая
+    к этому моменту уже лежит в списке обхода: обращение к её атрибутам падало с
+    AttributeError и обрывало весь прогон reject-all (инцидент 2026-09-06).
+    Уничтоженную строку пропускаем — её содержимое уже убрано вместе с внешней.
+    """
+    return bool(getattr(tag, "decomposed", False)) or tag.attrs is None
+
+
 def _apply_html(text: str, op: str, task_id: Optional[str]) -> Tuple[str, int]:
     """Применяет/откатывает HTML-нотацию правок внутри сырых HTML-таблиц (ТЗ п. 4.7).
 
@@ -473,6 +486,8 @@ def _transform_html_island(island: str, op: str, task_id: Optional[str]) -> Tupl
     # span.critic-ins / span.critic-del
     for span in soup.find_all("span", class_=lambda c: c and (
             "critic-ins" in c or "critic-del" in c)):
+        if _is_destroyed(span):
+            continue
         if not _matches(task_id, span.get("data-task", "")):
             continue
         is_ins = _has_class(span, "critic-ins")
@@ -488,6 +503,8 @@ def _transform_html_island(island: str, op: str, task_id: Optional[str]) -> Tupl
     # tr.critic-row-ins / tr.critic-row-del
     for tr in soup.find_all("tr", class_=lambda c: c and (
             "critic-row-ins" in c or "critic-row-del" in c)):
+        if _is_destroyed(tr):
+            continue
         if not _matches(task_id, tr.get("data-task", "")):
             continue
         is_ins = _has_class(tr, "critic-row-ins")
