@@ -25,6 +25,17 @@
 #             внутри — неутверждённое молча остаётся в «чистом ПРОМ». На дереве
 #             [КК] так пряталось 204 фрагмента разметки в 8 файлах.
 #
+#   --flag-page <JIRA-ID>
+#             Страничный флаг `unapproved_jira: <ID>` на ВСЕ страницы пути —
+#             для замороженного поддерева: требования не исключены, а отложены,
+#             их держат в git и возвращают через `critic apply <ID>`. Ключом
+#             --unapproved-jira такое не закрыть: он берёт задачу из маркеров в
+#             теле, а у таких страниц маркеров нет вовсе (нет таблицы «История
+#             изменений» → нет карты «цвет → задача»). Сторож: задача обязана
+#             встречаться маркером в обрабатываемом пути либо быть в манифесте
+#             миграции — иначе флаг невидим для `critic list`, страница осталась
+#             бы пустой навсегда и никто бы этого не заметил.
+#
 #   --unapproved-jira <file.json>
 #             Проставить страничный флаг `unapproved_jira: <ID>` там, где состав
 #             страницы целиком принадлежит неутверждённой задаче. По флагу
@@ -53,7 +64,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 import yaml
 
 from app.scripts.CI.critic import (
-    TASK_ID_PATTERN, UNAPPROVED_PAGE_KEY,
+    TASK_ID_PATTERN, UNAPPROVED_PAGE_KEY, collect_task_occurrences,
     _INS_RE, _DEL_RE, _OPENERS, _find_table_islands, _split_fenced_regions,
 )
 
@@ -337,6 +348,43 @@ def set_page_flag(fm_body: str, task: str) -> Tuple[str, bool]:
     return fm_body + new_line, True
 
 
+def page_flag_of(fm_body: str) -> Optional[str]:
+    """Задача из страничного флага frontmatter, если он уже стоит."""
+    m = re.search(r"^" + UNAPPROVED_PAGE_KEY + r":\s*(\S+)", fm_body, re.MULTILINE)
+    return m.group(1) if m else None
+
+
+def task_known_in_tree(task: str, files: List[Path]) -> bool:
+    """Встречается ли задача маркером хоть на одной странице обрабатываемого пути.
+
+    Сторож для --flag-page. Флаг задачи, которой в дереве нет, невидим: `list`
+    показывает только маркеры, поэтому такая задача не попадёт ни в «хвост»
+    незавершённых, ни в порядок вливания — страница останется пустой навсегда,
+    и никто этого не заметит. Асимметрия ошибок: лишний отказ безобиден,
+    потерянные требования — нет.
+    """
+    for path in files:
+        with open(path, "r", encoding="utf-8", newline="") as f:
+            if task in collect_task_occurrences(f.read()):
+                return True
+    return False
+
+
+def task_in_manifest(task: str, root: Path) -> bool:
+    """Задача перечислена в манифесте миграции рядом с выгрузкой (или выше по пути)."""
+    base = root if root.is_dir() else root.parent
+    for folder in [base, *base.parents][:5]:
+        manifest = folder / "migration-manifest.yaml"
+        if manifest.is_file():
+            try:
+                with open(manifest, "r", encoding="utf-8") as f:
+                    data = yaml.safe_load(f) or {}
+            except (OSError, yaml.YAMLError):
+                return False
+            return task in (data.get("tasks") or {})
+    return False
+
+
 def load_unapproved_ids(path: Path) -> set:
     """Список неутверждённых задач: ["GBO-1", ...] или {"unapproved_jira": [...]}."""
     data = json.loads(path.read_text(encoding="utf-8"))
@@ -351,7 +399,8 @@ def load_unapproved_ids(path: Path) -> set:
 
 
 def repair_file(path: Path, unfold: bool, unapproved: Optional[set],
-                flatten: bool = False, unfence: bool = False) -> Dict:
+                flatten: bool = False, unfence: bool = False,
+                flag_page: Optional[str] = None) -> Dict:
     """Починить один файл. Возвращает отчёт; ключ 'changed' — писать ли файл."""
     report: Dict = {"path": path, "unfolded": 0, "flagged": None, "flattened": 0,
                     "unfenced": 0, "changed": False, "skipped": None, "new_text": None}
@@ -392,6 +441,19 @@ def repair_file(path: Path, unfold: bool, unapproved: Optional[set],
     if unfold:
         new_fm, joined = unfold_frontmatter(new_fm)
         report["unfolded"] = joined
+
+    if flag_page:
+        # Прямая простановка флага по пути: страница заморожена целиком, её состав
+        # в ПРОМ не входит. В отличие от --unapproved-jira задача берётся не из
+        # маркеров в теле — у таких страниц маркеров может не быть вовсе
+        # (нет таблицы «История изменений» → нет карты «цвет → задача»).
+        current = page_flag_of(new_fm)
+        if current and current != flag_page:
+            report["skipped"] = "на странице уже стоит флаг другой задачи: " + current
+            return report
+        new_fm, added = set_page_flag(new_fm, flag_page)
+        if added:
+            report["flagged"] = flag_page
 
     if unapproved:
         tasks = marker_tasks(rest) & unapproved
@@ -453,6 +515,10 @@ def main(argv=None) -> int:
     parser.add_argument("--unfence-html", action="store_true",
                         help="ограждения кода внутри HTML-таблиц заменить на "
                              "<pre> (иначе apply/reject не видят маркеры внутри)")
+    parser.add_argument("--flag-page", metavar="JIRA-ID",
+                        help="проставить страничный флаг unapproved_jira на ВСЕХ "
+                             "страницах пути (замороженное поддерево: маркеров в "
+                             "теле может не быть вовсе)")
     parser.add_argument("--unapproved-jira", metavar="FILE",
                         help="JSON со списком неутверждённых задач: проставить "
                              "страничный флаг unapproved_jira")
@@ -461,9 +527,11 @@ def main(argv=None) -> int:
     args = parser.parse_args(argv)
 
     if not (args.unfold or args.unapproved_jira or args.flatten_nested
-            or args.unfence_html):
+            or args.unfence_html or args.flag_page):
         parser.error("укажите хотя бы одну починку: --unfold, --flatten-nested, "
-                     "--unfence-html и/или --unapproved-jira")
+                     "--unfence-html, --flag-page и/или --unapproved-jira")
+    if args.flag_page and not _TASK_ID_RE.fullmatch(args.flag_page):
+        parser.error("--flag-page: %r не похож на Jira ID" % args.flag_page)
 
     root = Path(args.root)
     if not root.exists():
@@ -480,12 +548,25 @@ def main(argv=None) -> int:
         print("Неутверждённых задач в списке: " + str(len(unapproved)))
 
     files = sorted(root.rglob("*.md")) if root.is_dir() else [root]
+
+    if args.flag_page:
+        # Сторож: флаг задачи, которой в дереве нет маркерами и нет в манифесте,
+        # невидим для `critic list` — страница осталась бы пустой навсегда.
+        if not (task_known_in_tree(args.flag_page, files)
+                or task_in_manifest(args.flag_page, root)):
+            print("ОШИБКА: задача " + args.flag_page + " не встречается в "
+                  "обрабатываемом пути маркерами и не найдена в манифесте "
+                  "миграции. Флаг такой задачи не увидит ни `critic list`, ни "
+                  "порядок вливания — страницы остались бы пустыми навсегда. "
+                  "Проверьте идентификатор.")
+            return 2
+
     changed = unfolded_total = flagged_total = flattened_total = unfenced_total = 0
     skipped: List[Tuple[Path, str]] = []
 
     for path in files:
         rep = repair_file(path, args.unfold, unapproved, args.flatten_nested,
-                          args.unfence_html)
+                          args.unfence_html, args.flag_page)
         if rep["skipped"] and rep["skipped"] != "нет frontmatter":
             skipped.append((path, rep["skipped"]))
         if not rep["changed"]:
