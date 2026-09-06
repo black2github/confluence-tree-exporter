@@ -18,7 +18,7 @@
 import hashlib
 from pathlib import Path
 
-VERSION = "1.6.0"
+VERSION = "1.6.1"
 
 
 def source_fingerprint() -> str:

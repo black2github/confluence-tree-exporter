@@ -207,9 +207,27 @@ def _resolve_page_content(page_data: Dict, include_unapproved: bool, critic: boo
                 if forced.first_seen and (entry["date"] is None
                                           or forced.first_seen < entry["date"]):
                     entry["date"] = forced.first_seen
+        # ГЕЙТ НА ВЫХОДЕ: конвейер не имеет права выпустить разметку, которую
+        # его же critic не читает. Литеральная вложенность маркеров валит
+        # apply/reject жёстко и обрывает прогон на первом файле — узнавали об
+        # этом только на боевом дереве у команды (инцидент 2026-09-05).
+        # Не падаем: страница уже собрана, терять её из-за разметки нельзя —
+        # предупреждаем и кладём в отчёт как позицию ручного разбора.
+        from app.scripts.CI.critic import find_literal_nesting
+        nesting = find_literal_nesting(content)
+        for nest in nesting:
+            logger.warning(
+                "  ⚠ '%s': строка %d — маркер %s содержит внутри %s "
+                "(литеральная вложенность; чинится run-repair --flatten-nested)",
+                name, nest["line"], nest["outer"], ", ".join(nest["inner"]) or "другой маркер")
+
         if critic_acc is not None:
             from app.scripts.migrate_colors import accumulate_page
             accumulate_page(critic_acc, name, result, survey_body_colors(raw, result))
+            for nest in nesting:
+                critic_acc["literal_nesting"].append(
+                    {"page": name, "line": nest["line"],
+                     "outer": nest["outer"], "inner": nest["inner"]})
             for rec in extractor._critic_report:  # признаки 1 (вложенность) и 2 (примыкание)
                 critic_acc["nested"].append(
                     {"page": name, "tasks": rec["tasks"], "html": rec["html"][:500],
