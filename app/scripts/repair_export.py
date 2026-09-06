@@ -39,13 +39,18 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 import yaml
 
-from app.scripts.CI.critic import TASK_ID_PATTERN, UNAPPROVED_PAGE_KEY
+from app.scripts.CI.critic import (
+    TASK_ID_PATTERN, UNAPPROVED_PAGE_KEY,
+    _INS_RE, _DEL_RE, _OPENERS, _split_fenced_regions,
+)
 
 # Маска Jira ID для проверки списка неутверждённых (как в migrate_confluence_tree).
 _TASK_ID_RE = re.compile(TASK_ID_PATTERN)
 
-# Вставка CriticMarkup с идентификатором задачи.
-_INS_RE = re.compile(r"\{\+\+\s*(" + TASK_ID_PATTERN + r")\s*:")
+# Опенер вставки с идентификатором задачи. Имя НЕ _INS_RE: под этим именем из
+# critic импортируется регулярка целого маркера с двумя группами — совпадение
+# имён перекрывало импорт и роняло уплощение.
+_INS_OPENER_RE = re.compile(r"\{\+\+\s*(" + TASK_ID_PATTERN + r")\s*:")
 
 # Строка-ключ frontmatter с непустым значением: `key: значение`.
 _KEY_WITH_VALUE_RE = re.compile(r"^([A-Za-z_][A-Za-z0-9_-]*): +(?!$)(.*)$")
@@ -107,9 +112,158 @@ def unfold_frontmatter(fm_body: str) -> Tuple[str, int]:
     return "".join(out), joined
 
 
+# Полный вложенный маркер любого типа — по нему режется тело внешнего маркера.
+_ANY_FULL_MARKER_RE = re.compile(
+    r"\{\+\+\s*" + TASK_ID_PATTERN + r"\s*:.*?\+\+\}"
+    r"|\{--\s*" + TASK_ID_PATTERN + r"\s*:.*?--\}"
+    r"|\{~~\s*" + TASK_ID_PATTERN + r"\s*:.*?~~\}",
+    re.DOTALL,
+)
+
+# Токены разметки — снимаются при сверке, что уплощение не тронуло текст.
+_MARKER_TOKENS_RE = re.compile(
+    r"\{[+~-]{2}\s*" + TASK_ID_PATTERN + r"\s*:\s?|\+\+\}|--\}|~~\}|~>"
+)
+
+
+# Токены разметки для разбора со стеком: опенеры с id и закрыватели.
+_TOKEN_RE = re.compile(
+    r"\{\+\+\s*(?P<ins_id>" + TASK_ID_PATTERN + r")\s*:\s?"
+    r"|\{--\s*(?P<del_id>" + TASK_ID_PATTERN + r")\s*:\s?"
+    r"|\{~~\s*(?P<sub_id>" + TASK_ID_PATTERN + r")\s*:\s?"
+    r"|\+\+\}|--\}|~~\}"
+)
+
+
+def strip_markers(text: str) -> str:
+    """Текст без разметки — инвариант, который уплощение обязано сохранить."""
+    return _MARKER_TOKENS_RE.sub("", text)
+
+
+def _flatten_region(region: str) -> Tuple[str, int]:
+    """
+    Уплощить вложенность в одной текстовой зоне. Возвращает (текст, число правок).
+
+    Разбор — со СТЕКОМ по токенам, а не регуляркой целого маркера: нежадный
+    матчинг закрывает внешний маркер на первом же `++}`, то есть на закрывателе
+    ВЛОЖЕННОГО, и настоящая структура остаётся невидимой (на этом первая версия
+    уплощения крутилась вхолостую).
+
+    Несопоставимые токены (незакрытый опенер, лишний закрыватель, подстановка
+    ~~ во внешней позиции) — зона возвращается без изменений: лучше оставить
+    файл линтеру, чем испортить разметку догадкой.
+    """
+    tokens = list(_TOKEN_RE.finditer(region))
+    if not tokens:
+        return region, 0
+
+    root: List[dict] = []
+    stack: List[dict] = []
+    pos = 0
+
+    def add_text(chunk: str):
+        target = stack[-1]["children"] if stack else root
+        if chunk:
+            target.append({"kind": "text", "text": chunk})
+
+    for tok in tokens:
+        add_text(region[pos:tok.start()])
+        pos = tok.end()
+        opener_id = tok.group("ins_id") or tok.group("del_id") or tok.group("sub_id")
+        if opener_id:
+            kind = "ins" if tok.group("ins_id") else ("del" if tok.group("del_id") else "sub")
+            if kind == "sub":
+                return region, 0            # подстановку не дробим
+            stack.append({"kind": kind, "task": opener_id, "children": [],
+                          "raw_open": tok.group(0)})
+        else:
+            closer = tok.group(0)
+            want = {"++}": "ins", "--}": "del", "~~}": "sub"}[closer]
+            if not stack or stack[-1]["kind"] != want:
+                return region, 0            # разметка не сходится — не трогаем
+            node = stack.pop()
+            (stack[-1]["children"] if stack else root).append(node)
+    add_text(region[pos:])
+
+    if stack:
+        return region, 0                    # остались незакрытые опенеры
+
+    nested = _count_nested(root)
+    if not nested:
+        return region, 0
+
+    return "".join(_render_flat(root)), nested
+
+
+def _count_nested(nodes: List[dict]) -> int:
+    """Сколько маркеров содержат внутри себя другие маркеры."""
+    total = 0
+    for node in nodes:
+        if node["kind"] == "text":
+            continue
+        if any(ch["kind"] != "text" for ch in node["children"]):
+            total += 1
+        total += _count_nested(node["children"])
+    return total
+
+
+def _render_flat(nodes: List[dict], parent: Optional[dict] = None) -> List[str]:
+    """
+    Развернуть дерево в плоскую последовательность маркеров.
+
+    Текст родителя остаётся за его задачей, вложенные маркеры выносятся рядом.
+    Пробельные куски маркером не накрываются — это структура (переводы строк,
+    маркеры списка), а не требование.
+    """
+    opener = {"ins": "{++", "del": "{--"}
+    closer = {"ins": "++}", "del": "--}"}
+    out: List[str] = []
+    for node in nodes:
+        if node["kind"] == "text":
+            if parent is not None and node["text"].strip():
+                out.append(f"{opener[parent['kind']]}{parent['task']}: "
+                           f"{node['text']}{closer[parent['kind']]}")
+            else:
+                out.append(node["text"])
+            continue
+        if any(ch["kind"] != "text" for ch in node["children"]):
+            out.extend(_render_flat(node["children"], node))
+        else:
+            body = "".join(ch["text"] for ch in node["children"])
+            out.append(f"{opener[node['kind']]}{node['task']}: {body}{closer[node['kind']]}")
+    return out
+
+
+def flatten_nested(text: str) -> Tuple[str, int]:
+    """
+    Уплощить литеральную вложенность маркеров во всём файле.
+
+    {++A: X {++B: Y++} Z++}  →  {++A: X++} {++B: Y++} {++A: Z++}
+
+    Нотация вложенность запрещает (разбор регулярками, не рекурсивным парсером),
+    и apply/reject на таком файле падают жёстко, обрывая весь прогон. Экспортёр
+    её всё же порождает, когда блочный маркер накрывает участок с врезками
+    соседних задач (инцидент 2026-09-05).
+
+    Внутренние маркеры переносятся как есть; текст внешнего маркера остаётся за
+    его задачей. Пробельные куски маркером не накрываются — это структура
+    (переводы строк, маркеры списка), а не требование. Замены {~~…~>…~~}
+    не трогаем: у подстановки два тела, безопасного дробления нет.
+    """
+    out, total = [], 0
+    for kind, region, _base in _split_fenced_regions(text):
+        if kind == "code":
+            out.append(region)              # fenced-код — байт-в-байт
+            continue
+        new_region, count = _flatten_region(region)
+        out.append(new_region)
+        total += count
+    return "".join(out), total
+
+
 def marker_tasks(body: str) -> set:
     """Идентификаторы задач, чьи вставки есть в теле страницы."""
-    return {m.group(1) for m in _INS_RE.finditer(body)}
+    return {m.group(1) for m in _INS_OPENER_RE.finditer(body)}
 
 
 def set_page_flag(fm_body: str, task: str) -> Tuple[str, bool]:
@@ -139,15 +293,27 @@ def load_unapproved_ids(path: Path) -> set:
     return result
 
 
-def repair_file(path: Path, unfold: bool, unapproved: Optional[set]) -> Dict:
+def repair_file(path: Path, unfold: bool, unapproved: Optional[set],
+                flatten: bool = False) -> Dict:
     """Починить один файл. Возвращает отчёт; ключ 'changed' — писать ли файл."""
-    report: Dict = {"path": path, "unfolded": 0, "flagged": None,
+    report: Dict = {"path": path, "unfolded": 0, "flagged": None, "flattened": 0,
                     "changed": False, "skipped": None, "new_text": None}
     with open(path, "r", encoding="utf-8", newline="") as f:
         original = f.read()
 
     parts = split_frontmatter(original)
     if parts is None:
+        # Уплощение работает и без frontmatter — оно про тело файла
+        if flatten:
+            new_text, count = flatten_nested(original)
+            if count:
+                if strip_markers(new_text) != strip_markers(original):
+                    report["skipped"] = "уплощение изменило бы текст — файл не тронут"
+                    return report
+                report["flattened"] = count
+                report["changed"] = True
+                report["new_text"] = new_text
+                return report
         report["skipped"] = "нет frontmatter"
         return report
     head, fm_body, rest = parts
@@ -174,7 +340,17 @@ def repair_file(path: Path, unfold: bool, unapproved: Optional[set]) -> Dict:
             if added:
                 report["flagged"] = task
 
-    if new_fm == fm_body:
+    new_rest = rest
+    if flatten:
+        new_rest, count = flatten_nested(rest)
+        if count:
+            # Инвариант: уплощение переставляет ТОЛЬКО разметку, текст неприкосновенен
+            if strip_markers(new_rest) != strip_markers(rest):
+                report["skipped"] = "уплощение изменило бы текст — файл не тронут"
+                return report
+            report["flattened"] = count
+
+    if new_fm == fm_body and new_rest == rest:
         return report
 
     # Гейт смысла: правка обязана быть чисто оформительской (плюс новый флаг).
@@ -191,7 +367,7 @@ def repair_file(path: Path, unfold: bool, unapproved: Optional[set]) -> Dict:
         return report
 
     report["changed"] = True
-    report["new_text"] = head + new_fm + rest
+    report["new_text"] = head + new_fm + new_rest
     return report
 
 
@@ -201,6 +377,9 @@ def main(argv=None) -> int:
     parser.add_argument("root", help="корень выгрузки (каталог с .md) или один файл")
     parser.add_argument("--unfold", action="store_true",
                         help="склеить свёрнутые значения frontmatter в одну строку")
+    parser.add_argument("--flatten-nested", action="store_true",
+                        help="уплощить литеральную вложенность маркеров "
+                             "(apply/reject на таких файлах падают)")
     parser.add_argument("--unapproved-jira", metavar="FILE",
                         help="JSON со списком неутверждённых задач: проставить "
                              "страничный флаг unapproved_jira")
@@ -208,8 +387,9 @@ def main(argv=None) -> int:
                         help="показать, что изменилось бы, ничего не записывая")
     args = parser.parse_args(argv)
 
-    if not args.unfold and not args.unapproved_jira:
-        parser.error("укажите хотя бы одну починку: --unfold и/или --unapproved-jira")
+    if not (args.unfold or args.unapproved_jira or args.flatten_nested):
+        parser.error("укажите хотя бы одну починку: --unfold, --flatten-nested "
+                     "и/или --unapproved-jira")
 
     root = Path(args.root)
     if not root.exists():
@@ -226,22 +406,25 @@ def main(argv=None) -> int:
         print("Неутверждённых задач в списке: " + str(len(unapproved)))
 
     files = sorted(root.rglob("*.md")) if root.is_dir() else [root]
-    changed = unfolded_total = flagged_total = 0
+    changed = unfolded_total = flagged_total = flattened_total = 0
     skipped: List[Tuple[Path, str]] = []
 
     for path in files:
-        rep = repair_file(path, args.unfold, unapproved)
+        rep = repair_file(path, args.unfold, unapproved, args.flatten_nested)
         if rep["skipped"] and rep["skipped"] != "нет frontmatter":
             skipped.append((path, rep["skipped"]))
         if not rep["changed"]:
             continue
         changed += 1
         unfolded_total += rep["unfolded"]
+        flattened_total += rep["flattened"]
         if rep["flagged"]:
             flagged_total += 1
         what = []
         if rep["unfolded"]:
             what.append("склеено строк: " + str(rep["unfolded"]))
+        if rep["flattened"]:
+            what.append("уплощено маркеров: " + str(rep["flattened"]))
         if rep["flagged"]:
             what.append("флаг " + rep["flagged"])
         prefix = "[dry-run] " if args.dry_run else ""
@@ -257,6 +440,7 @@ def main(argv=None) -> int:
     print(prefix + "файлов просмотрено " + str(len(files)) +
           ", изменено " + str(changed) +
           " (склеено строк " + str(unfolded_total) +
+          ", уплощено маркеров " + str(flattened_total) +
           ", флагов проставлено " + str(flagged_total) +
           ", пропущено с предупреждением " + str(len(skipped)) + ")")
     return 0

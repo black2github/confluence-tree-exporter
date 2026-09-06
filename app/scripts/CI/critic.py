@@ -65,6 +65,9 @@ _INS_RE = re.compile(r"\{\+\+\s*(" + TASK_ID_PATTERN + r")\s*:\s*(.*?)\+\+\}", r
 _DEL_RE = re.compile(r"\{--\s*(" + TASK_ID_PATTERN + r")\s*:\s*(.*?)--\}", re.DOTALL)
 _SUB_RE = re.compile(r"\{~~\s*(" + TASK_ID_PATTERN + r")\s*:\s*(.*?)~>(.*?)~~\}", re.DOTALL)
 
+# Идентификатор задачи сразу за опенером — чтобы назвать вложенные маркеры.
+_ID_AFTER_OPENER_RE = re.compile(r"\{[+~-]{2}\s*(" + TASK_ID_PATTERN + r")\s*:")
+
 # Открывающая/закрывающая fenced-fence в начале строки (``` или ~~~, 3+ символа).
 _FENCE_RE = re.compile(r"^[ \t]*(?:`{3,}|~{3,})")
 
@@ -141,6 +144,38 @@ def _split_fenced_regions(text: str) -> List[Tuple[str, str, int]]:
 def _line_of(region_text: str, offset: int, base_line: int) -> int:
     """Номер строки в исходном тексте для смещения offset внутри зоны."""
     return base_line + region_text.count("\n", 0, offset)
+
+
+def find_literal_nesting(text: str) -> List[dict]:
+    """
+    Маркеры, внутрь которых попал маркер другой задачи (литеральная вложенность).
+
+    Нотация вложенность запрещает: разбор идёт регулярками, а не рекурсивным
+    парсером. Экспортёр такую разметку всё же порождает, когда блочный маркер
+    накрывает участок, где есть врезки соседних задач (инцидент 2026-09-05:
+    список, где часть пунктов покрашена другими задачами). Найденное здесь
+    показывает линтер (E9) и чинит уплощением repair_export.
+
+    Возвращает записи {outer, inner, start, end, line} — по одной на маркер.
+    """
+    found: List[dict] = []
+    for kind, region, base_line in _split_fenced_regions(text):
+        if kind == "code":
+            continue
+        for rx in (_INS_RE, _DEL_RE, _SUB_RE):
+            for m in rx.finditer(region):
+                body = "".join(g for g in m.groups()[1:] if g)
+                if not any(op in body for op in _OPENERS):
+                    continue
+                inner = [i.group(1) for i in _ID_AFTER_OPENER_RE.finditer(body)]
+                found.append({
+                    "outer": m.group(1),
+                    "inner": inner,
+                    "start": m.start(),
+                    "end": m.end(),
+                    "line": _line_of(region, m.start(), base_line),
+                })
+    return found
 
 
 def _validate_inline(region_text: str, base_line: int, path: Optional[Path]) -> None:
@@ -773,6 +808,15 @@ def lint_text(text: str, path: Optional[Path] = None) -> List[Finding]:
         add(_line_at(text, f["pos"]), "error", "E8",
             f"удаляемый текст входит в состав вставки задачи {f['insert_task']} — "
             f"на ПРОМ не был (нарушение п. 4.5.1)")
+
+    # E9: литеральная вложенность маркеров. apply/reject падают на таком файле
+    # жёстко (_validate_inline) и обрывают весь прогон на первом же случае —
+    # линтер обязан показать их ВСЕ заранее, одним списком.
+    for nest in find_literal_nesting(text):
+        inner = ", ".join(nest["inner"]) or "другой маркер"
+        add(nest["line"], "error", "E9",
+            f"литеральная вложенность: внутри маркера {nest['outer']} находится {inner} "
+            f"(нотация вложенность запрещает; чинится уплощением)")
 
     # Стабильный порядок + дедупликация одинаковых находок.
     seen = set()
