@@ -39,6 +39,7 @@ def new_accumulator() -> dict:
         "jira_unextractable": [],
         "multi_task_rows": [],        # несколько задач в одной строке истории (4.2.г)
         "literal_nesting": [],        # гейт выхода: маркер проглотил чужой маркер
+        "markers_in_code": [],        # гейт выхода: блок кода накрыл маркеры
         "unresolved_placeholders": [],
         "nested": [],                 # уплощённые вложенности (ТЗ 4.5) — заполняет вызывающий
         "tasks": {},                  # task_id -> {color, confidence, pages:set, markers}
@@ -138,7 +139,8 @@ def finalize(acc: dict, service: str, migrated_at: str) -> Tuple[dict, dict]:
 
     positions = (len(acc["unresolved_placeholders"]) + len(acc["collisions"])
                  + len(acc["jira_unextractable"]) + len(acc["nested"])
-                 + len(acc["multi_task_rows"]) + len(acc["literal_nesting"]))
+                 + len(acc["multi_task_rows"]) + len(acc["literal_nesting"])
+                 + len(acc["markers_in_code"]))
     report = {
         "migrated_at": migrated_at,
         "service": service,
@@ -154,6 +156,7 @@ def finalize(acc: dict, service: str, migrated_at: str) -> Tuple[dict, dict]:
         "jira_unextractable": acc["jira_unextractable"],
         "multi_task_rows": acc["multi_task_rows"],
         "literal_nesting": acc["literal_nesting"],
+        "markers_in_code": acc["markers_in_code"],
         "nested_flattened": acc["nested"],
         "color_summary": sorted(acc["color_summary"],
                                 key=lambda c: (c["color"], -c["count"], c["page"])),
@@ -336,6 +339,14 @@ def render_report_md(report: dict) -> str:
               f"{', '.join(n['inner']) or 'другой маркер'} "
               f"(починка: run-repair --flatten-nested)"
               for n in report.get("literal_nesting", [])])
+
+    # Гейт выхода: блок кода переносится байт-в-байт, поэтому маркеры внутри него
+    # не увидит ни apply, ни reject — неутверждённое останется в «чистом ПРОМ».
+    _section("Маркеры внутри блока кода — apply/reject их не увидят",
+             [f"- «{c['page']}», строка {c['line']}: блок кода ({c['chars']} символов) "
+              f"накрыл {c['markers']} маркеров задач {', '.join(c['tasks'])} "
+              f"(разобрать вручную либо закрыть страничным флагом unapproved_jira)"
+              for c in report.get("markers_in_code", [])])
 
     nested = report.get("nested_flattened", [])
     _by_conf = lambda c: [f"- задачи {n['tasks']} на «{n['page']}»"

@@ -3,7 +3,7 @@
 # Разовая починка УЖЕ ВЫГРУЖЕННЫХ деревьев: правки экспортёра действуют начиная
 # со следующей миграции, а сделанные ранее выгрузки остаются как есть.
 #
-# Две починки, обе включаются флагами и обе идемпотентны:
+# Починки включаются флагами, все идемпотентны:
 #
 #   --unfold  Свёрнутые значения frontmatter → одной строкой. PyYAML сворачивал
 #             длинное значение по ширине 80 символов (для кириллицы ~150 байт),
@@ -11,6 +11,19 @@
 #             кавычкой: разные страницы выглядели дублями (инцидент 2026-08-23).
 #             YAML при этом валиден, поэтому чиним НЕ переразбором файла, а
 #             склейкой строк — прочие байты не трогаем.
+#
+#   --flatten-nested
+#             Литеральная вложенность маркеров → рядом стоящие маркеры. Нотация
+#             вложенность запрещает, apply/reject на таком файле падают жёстко и
+#             обрывают весь прогон (инцидент 2026-09-05).
+#
+#   --unfence-html
+#             Ограждения кода внутри HTML-таблицы → <pre>…</pre>. Экспортёр
+#             заворачивал JSON-подобный абзац в ```…``` даже внутри ячейки,
+#             отданной сырым HTML; содержимое между ограждениями считается кодом
+#             и переносится байт-в-байт, поэтому apply/reject не видят маркеры
+#             внутри — неутверждённое молча остаётся в «чистом ПРОМ». На дереве
+#             [КК] так пряталось 204 фрагмента разметки в 8 файлах.
 #
 #   --unapproved-jira <file.json>
 #             Проставить страничный флаг `unapproved_jira: <ID>` там, где состав
@@ -41,7 +54,7 @@ import yaml
 
 from app.scripts.CI.critic import (
     TASK_ID_PATTERN, UNAPPROVED_PAGE_KEY,
-    _INS_RE, _DEL_RE, _OPENERS, _split_fenced_regions,
+    _INS_RE, _DEL_RE, _OPENERS, _find_table_islands, _split_fenced_regions,
 )
 
 # Маска Jira ID для проверки списка неутверждённых (как в migrate_confluence_tree).
@@ -261,6 +274,50 @@ def flatten_nested(text: str) -> Tuple[str, int]:
     return "".join(out), total
 
 
+_FENCE_TOKEN_RE = re.compile(r"`{3,}")
+
+
+def unfence_html(text: str) -> Tuple[str, int]:
+    """
+    Ограждения кода внутри HTML-острова заменить на <pre>…</pre>.
+
+    Экспортёр заворачивал JSON-подобный абзац в ```…``` даже внутри ячейки
+    таблицы, отданной сырым HTML. В markdown такое не рендерится как код нигде,
+    а для конвейера последствия тяжелее: содержимое между ограждениями считается
+    кодом и переносится байт-в-байт, поэтому apply/reject не видят маркеры
+    внутри — неутверждённые требования молча остаются в «чистом ПРОМ».
+    На дереве [КК] так пряталось 204 фрагмента разметки в 8 файлах.
+
+    Заменяются ТОЛЬКО ограничители, содержимое не трогается. Остров с нечётным
+    числом ограждений пропускается: пары не сходятся — значит, случай не наш,
+    и гадать нельзя (его покажет линтер).
+    """
+    islands = _find_table_islands(text)
+    if not islands:
+        return text, 0
+    out: List[str] = []
+    last = 0
+    total = 0
+    for start, end in islands:
+        segment = text[start:end]
+        spans = [m.span() for m in _FENCE_TOKEN_RE.finditer(segment)]
+        if len(spans) < 2 or len(spans) % 2:
+            continue
+        parts: List[str] = []
+        prev = 0
+        for i, (a, b) in enumerate(spans):
+            parts.append(segment[prev:a])
+            parts.append("<pre>" if i % 2 == 0 else "</pre>")
+            prev = b
+        parts.append(segment[prev:])
+        out.append(text[last:start])
+        out.append("".join(parts))
+        last = end
+        total += len(spans) // 2
+    out.append(text[last:])
+    return "".join(out), total
+
+
 def marker_tasks(body: str) -> set:
     """Идентификаторы задач, чьи вставки есть в теле страницы."""
     return {m.group(1) for m in _INS_OPENER_RE.finditer(body)}
@@ -294,23 +351,30 @@ def load_unapproved_ids(path: Path) -> set:
 
 
 def repair_file(path: Path, unfold: bool, unapproved: Optional[set],
-                flatten: bool = False) -> Dict:
+                flatten: bool = False, unfence: bool = False) -> Dict:
     """Починить один файл. Возвращает отчёт; ключ 'changed' — писать ли файл."""
     report: Dict = {"path": path, "unfolded": 0, "flagged": None, "flattened": 0,
-                    "changed": False, "skipped": None, "new_text": None}
+                    "unfenced": 0, "changed": False, "skipped": None, "new_text": None}
     with open(path, "r", encoding="utf-8", newline="") as f:
         original = f.read()
 
     parts = split_frontmatter(original)
     if parts is None:
-        # Уплощение работает и без frontmatter — оно про тело файла
-        if flatten:
-            new_text, count = flatten_nested(original)
-            if count:
-                if strip_markers(new_text) != strip_markers(original):
-                    report["skipped"] = "уплощение изменило бы текст — файл не тронут"
-                    return report
-                report["flattened"] = count
+        # Уплощение и распакование ограждений работают и без frontmatter —
+        # они про тело файла.
+        if flatten or unfence:
+            new_text = original
+            if flatten:
+                new_text, count = flatten_nested(new_text)
+                if count:
+                    if strip_markers(new_text) != strip_markers(original):
+                        report["skipped"] = "уплощение изменило бы текст — файл не тронут"
+                        return report
+                    report["flattened"] = count
+            if unfence:
+                new_text, fenced = unfence_html(new_text)
+                report["unfenced"] = fenced
+            if new_text != original:
                 report["changed"] = True
                 report["new_text"] = new_text
                 return report
@@ -350,6 +414,12 @@ def repair_file(path: Path, unfold: bool, unapproved: Optional[set],
                 return report
             report["flattened"] = count
 
+    if unfence:
+        # Инвариант держится конструкцией: unfence_html подменяет ровно найденные
+        # ограничители и не трогает ни байта между ними (см. тесты режима).
+        new_rest, fenced = unfence_html(new_rest)
+        report["unfenced"] = fenced
+
     if new_fm == fm_body and new_rest == rest:
         return report
 
@@ -380,6 +450,9 @@ def main(argv=None) -> int:
     parser.add_argument("--flatten-nested", action="store_true",
                         help="уплощить литеральную вложенность маркеров "
                              "(apply/reject на таких файлах падают)")
+    parser.add_argument("--unfence-html", action="store_true",
+                        help="ограждения кода внутри HTML-таблиц заменить на "
+                             "<pre> (иначе apply/reject не видят маркеры внутри)")
     parser.add_argument("--unapproved-jira", metavar="FILE",
                         help="JSON со списком неутверждённых задач: проставить "
                              "страничный флаг unapproved_jira")
@@ -387,9 +460,10 @@ def main(argv=None) -> int:
                         help="показать, что изменилось бы, ничего не записывая")
     args = parser.parse_args(argv)
 
-    if not (args.unfold or args.unapproved_jira or args.flatten_nested):
-        parser.error("укажите хотя бы одну починку: --unfold, --flatten-nested "
-                     "и/или --unapproved-jira")
+    if not (args.unfold or args.unapproved_jira or args.flatten_nested
+            or args.unfence_html):
+        parser.error("укажите хотя бы одну починку: --unfold, --flatten-nested, "
+                     "--unfence-html и/или --unapproved-jira")
 
     root = Path(args.root)
     if not root.exists():
@@ -406,11 +480,12 @@ def main(argv=None) -> int:
         print("Неутверждённых задач в списке: " + str(len(unapproved)))
 
     files = sorted(root.rglob("*.md")) if root.is_dir() else [root]
-    changed = unfolded_total = flagged_total = flattened_total = 0
+    changed = unfolded_total = flagged_total = flattened_total = unfenced_total = 0
     skipped: List[Tuple[Path, str]] = []
 
     for path in files:
-        rep = repair_file(path, args.unfold, unapproved, args.flatten_nested)
+        rep = repair_file(path, args.unfold, unapproved, args.flatten_nested,
+                          args.unfence_html)
         if rep["skipped"] and rep["skipped"] != "нет frontmatter":
             skipped.append((path, rep["skipped"]))
         if not rep["changed"]:
@@ -418,6 +493,7 @@ def main(argv=None) -> int:
         changed += 1
         unfolded_total += rep["unfolded"]
         flattened_total += rep["flattened"]
+        unfenced_total += rep["unfenced"]
         if rep["flagged"]:
             flagged_total += 1
         what = []
@@ -425,6 +501,8 @@ def main(argv=None) -> int:
             what.append("склеено строк: " + str(rep["unfolded"]))
         if rep["flattened"]:
             what.append("уплощено маркеров: " + str(rep["flattened"]))
+        if rep["unfenced"]:
+            what.append("ограждений распаковано: " + str(rep["unfenced"]))
         if rep["flagged"]:
             what.append("флаг " + rep["flagged"])
         prefix = "[dry-run] " if args.dry_run else ""
@@ -441,6 +519,7 @@ def main(argv=None) -> int:
           ", изменено " + str(changed) +
           " (склеено строк " + str(unfolded_total) +
           ", уплощено маркеров " + str(flattened_total) +
+          ", ограждений распаковано " + str(unfenced_total) +
           ", флагов проставлено " + str(flagged_total) +
           ", пропущено с предупреждением " + str(len(skipped)) + ")")
     return 0

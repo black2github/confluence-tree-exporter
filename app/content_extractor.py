@@ -557,6 +557,21 @@ class ContentExtractor:
         else:
             return content
 
+    # Контексты, где страница отдаётся сырым HTML: внутри ячейки таблицы
+    # markdown-ограждение не рендерится как код нигде, а для конвейера хуже —
+    # содержимое между ``` считается кодом и переносится байт-в-байт, поэтому
+    # apply/reject не видят маркеры внутри, и неутверждённое молча остаётся в
+    # «чистом ПРОМ» (инцидент 2026-09-06: 204 фрагмента в 8 файлах дерева [КК];
+    # уже выгруженные деревья лечит repair_export --unfence-html).
+    # В таких контекстах отдаём <pre> — валидный HTML с тем же смыслом.
+    _HTML_CONTEXTS = ("table_cell", "nested_table_cell")
+
+    def _code_block(self, code_text: str, context: str) -> str:
+        """Блок кода в форме, уместной для текущего контекста."""
+        if context in self._HTML_CONTEXTS:
+            return f"<pre>{code_text}</pre>"
+        return f"\n```\n{code_text}\n```\n"
+
     def _process_code_block(self, element: Tag, context: str) -> str:
         """
         Обработка блоков кода.
@@ -585,7 +600,7 @@ class ContentExtractor:
             code_text = code_text.strip()
             if not code_text:
                 return ""
-            return f"\n```\n{code_text}\n```\n"
+            return self._code_block(code_text, context)
 
         # <pre> — всегда многострочный блок
         if name == "pre":
@@ -593,7 +608,7 @@ class ContentExtractor:
             code_text = code_text.strip()
             if not code_text:
                 return ""
-            return f"\n```\n{code_text}\n```\n"
+            return self._code_block(code_text, context)
 
         # <code> — inline если однострочный, блок если многострочный
         if name == "code":
@@ -602,7 +617,7 @@ class ContentExtractor:
             if "\n" not in code_text.strip():
                 return f"`{code_text.strip()}`"
             # Многострочный
-            return f"\n```\n{code_text.strip()}\n```\n"
+            return self._code_block(code_text.strip(), context)
 
         return ""
 
@@ -1549,7 +1564,7 @@ class ContentExtractor:
                 finally:
                     self._critic_suppress = prev
                 stripped = content.strip()
-                return f"\n```\n{stripped}\n```\n" if stripped else ""
+                return self._code_block(stripped, context) if stripped else ""
 
             content = self._process_children(element, context)
             if not content:
@@ -1567,7 +1582,7 @@ class ContentExtractor:
         # Детекция JSON-блоков: параграф начинается с { и заканчивается на }
         stripped = content.strip()
         if stripped.startswith('{') and stripped.endswith('}'):
-            return f"\n```\n{stripped}\n```\n"
+            return self._code_block(stripped, context)
 
         # Добавляем перевод строки для всех контекстов
         if context in ["table_cell", "nested_table_cell"]:

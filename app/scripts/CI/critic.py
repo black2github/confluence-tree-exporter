@@ -69,7 +69,12 @@ _SUB_RE = re.compile(r"\{~~\s*(" + TASK_ID_PATTERN + r")\s*:\s*(.*?)~>(.*?)~~\}"
 _ID_AFTER_OPENER_RE = re.compile(r"\{[+~-]{2}\s*(" + TASK_ID_PATTERN + r")\s*:")
 
 # Открывающая/закрывающая fenced-fence в начале строки (``` или ~~~, 3+ символа).
-_FENCE_RE = re.compile(r"^[ \t]*(?:`{3,}|~{3,})")
+# Правило CommonMark: у backtick-ограждения инфо-строка не может содержать обратную
+# кавычку. Без этого ограничения строки вида ```` ```"filter"``: {` ```` — а это не
+# ограждение, а склеенный inline-код — принимались за открывающие, и код-зона
+# накрывала требования (инцидент 2026-09-06: в одном файле шесть таких «ограждений»,
+# из-за них reject не доходил до маркеров с первого раза). Для ~~~ ограничения нет.
+_FENCE_RE = re.compile(r"^[ \t]*(?:`{3,}[^`\n]*|~{3,}[^\n]*)\r?\n?$")
 
 
 class CriticError(Exception):
@@ -175,6 +180,36 @@ def find_literal_nesting(text: str) -> List[dict]:
                     "end": m.end(),
                     "line": _line_of(region, m.start(), base_line),
                 })
+    return found
+
+
+def find_markers_in_code(text: str) -> List[dict]:
+    """
+    Маркеры, оказавшиеся внутри блока кода: apply/reject туда не заглядывают.
+
+    Fenced-код переносится байт-в-байт (ТЗ п. 5.3) — это правильно для макросов и
+    примеров запросов, но экспортёр выпускает и незакрытые ограждения, и тогда блок
+    кода накрывает кусок требований. Последствия двойные: неутверждённое остаётся в
+    «чистом ПРОМ» (reject до него не дотягивается), а после того как соседние правки
+    сдвинут границы блока, остаток вылезает и требует ещё одного прохода.
+    Инцидент 2026-09-06: блок в 20 689 символов прятал 65 маркеров.
+
+    Возвращает записи {line, chars, markers, tasks} — по одной на блок кода.
+    """
+    found: List[dict] = []
+    for kind, region, base_line in _split_fenced_regions(text):
+        if kind != "code":
+            continue
+        tasks = [m.group(1) for m in _ID_AFTER_OPENER_RE.finditer(region)]
+        tasks += _DATA_TASK_RE.findall(region)   # HTML-нотация, определена ниже по модулю
+        if not tasks:
+            continue
+        found.append({
+            "line": base_line,
+            "chars": len(region),
+            "markers": len(tasks),
+            "tasks": sorted(set(tasks)),
+        })
     return found
 
 
@@ -639,22 +674,69 @@ def apply_page_flag(text: str, op: str, task_id: Optional[str]) -> Tuple[str, in
     return text, 0
 
 
+# Потолок проходов по одному файлу. Один проход не всегда доводит дело до конца:
+# блок кода может накрывать участок с маркерами (экспортёр выпускает незакрытое
+# ограждение), первый проход убирает текст, границы блока схлопываются — и остаток
+# становится виден только следующему проходу. Прогон дерева по нескольку раз руками —
+# источник ошибок: аналитик не обязан помнить про «гоняй, пока не сойдётся».
+# Потолок нужен на случай колебаний: молча крутиться в цикле хуже, чем упасть.
+MAX_EDIT_PASSES = 10
+
+
+def process_text_until_stable(text: str, op: str, task_id: Optional[str],
+                              status_column: str = STATUS_COLUMN,
+                              path: Optional[Path] = None,
+                              max_passes: int = MAX_EDIT_PASSES) -> Tuple[str, int, int]:
+    """Правит текст до неподвижной точки.
+
+    Возвращает (текст, всего правок, число проходов, ЧТО-ТО изменивших) —
+    подтверждающий проход в счёт не идёт, поэтому «проходов > 1» означает ровно
+    «одного захода не хватило».
+
+    Повтор той же операции над собственным результатом — это и есть определение
+    идемпотентности, которой у команды до сих пор не было.
+    """
+    total = 0
+    productive = 0          # проходы, которые что-то изменили; подтверждающий не в счёт
+    for _ in range(max_passes + 1):
+        new_text, count = process_text(text, op, task_id, status_column, path)
+        # Страничный флаг — ПОСЛЕ разбора маркеров: reject доводит очистку до конца
+        # там, где нотация бессильна (fenced-код макросов), apply снимает отработавший
+        # флаг. Порядок важен: сначала снимаются чужие маркеры, потом решается судьба
+        # остатка страницы.
+        new_text, page_count = apply_page_flag(new_text, op, task_id)
+        count += page_count
+        if count == 0:
+            return text, total, productive
+        total += count
+        productive += 1
+        text = new_text
+        if productive >= max_passes:
+            break
+    raise CriticError(
+        f"правки не сходятся за {max_passes} проходов — разметка колеблется, "
+        f"нужен ручной разбор", path)
+
+
+def process_file_verbose(path: Path, op: str, task_id: Optional[str],
+                         status_column: str = STATUS_COLUMN,
+                         dry_run: bool = False) -> Tuple[int, int]:
+    """Обрабатывает один .md файл до неподвижной точки. Возвращает (правок, проходов)."""
+    original = _read_text_preserving(path)
+    new_text, count, passes = process_text_until_stable(
+        original, op, task_id, status_column, path)
+    if count == 0 or new_text == original:
+        return 0, passes  # идемпотентность: без изменений файл не трогаем (ТЗ п. 5.3)
+    if not dry_run:
+        _write_text_preserving(path, new_text)
+    return count, passes
+
+
 def process_file(path: Path, op: str, task_id: Optional[str],
                  status_column: str = STATUS_COLUMN,
                  dry_run: bool = False) -> int:
     """Обрабатывает один .md файл. Возвращает число правок. Не пишет неизменённый файл."""
-    original = _read_text_preserving(path)
-    new_text, count = process_text(original, op, task_id, status_column, path)
-    # Страничный флаг — ПОСЛЕ разбора маркеров: reject доводит очистку до конца
-    # там, где нотация бессильна (fenced-код макросов), apply снимает отработавший
-    # флаг. Порядок важен: сначала снимаются чужие маркеры, потом решается судьба
-    # остатка страницы.
-    new_text, page_count = apply_page_flag(new_text, op, task_id)
-    count += page_count
-    if count == 0 or new_text == original:
-        return 0  # идемпотентность: без изменений файл не трогаем (ТЗ п. 5.3)
-    if not dry_run:
-        _write_text_preserving(path, new_text)
+    count, _passes = process_file_verbose(path, op, task_id, status_column, dry_run)
     return count
 
 
@@ -867,21 +949,29 @@ def _run_edit(op: str, task_id: Optional[str], root: Path, status_column: str,
     files = _iter_md_files(root)
     changed_files = 0
     total = 0
+    multipass = 0          # файлы, где одного прохода не хватило — сигнал о разметке
     for fp in files:
         try:
-            count = process_file(fp, op, task_id, status_column, dry_run)
+            count, passes = process_file_verbose(fp, op, task_id, status_column, dry_run)
         except CriticError as e:
             print(f"ОШИБКА: {e}", file=sys.stderr)
             return 2  # ненулевой код при любой неоднозначности (ТЗ п. 5.3)
         if count:
             changed_files += 1
             total += count
+            if passes > 1:
+                multipass += 1
             verb = "будет изменён" if dry_run else "изменён"
             print(f"{fp}: {verb} ({count} правок)")
 
     label = "задача " + task_id if task_id else "все задачи"
     prefix = "[dry-run] " if dry_run else ""
     print(f"{prefix}{op} ({label}): файлов изменено {changed_files}, правок {total}")
+    if multipass:
+        # Повторять команду руками не нужно — она уже сошлась; но знать, что разметка
+        # такая, стоит: обычно это блок кода, накрывший маркеры (см. run-critic lint).
+        print(f"  из них потребовали нескольких проходов: {multipass} "
+              f"(разметка с маркерами внутри блоков кода; подробности — lint)")
     return 0
 
 
