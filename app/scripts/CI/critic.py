@@ -943,6 +943,23 @@ def _iter_md_files(path: Path) -> List[Path]:
     return sorted(path.rglob("*.md"))
 
 
+def file_mentions_task(path: Path, task_id: str) -> bool:
+    """Встречается ли идентификатор задачи в файле хотя бы подстрокой.
+
+    Отбор перед разбором: адресная правка (`apply <ID>` / `reject <ID>`) не может
+    изменить файл, где идентификатора нет вовсе, — ни в маркере любой нотации, ни
+    в страничном флаге frontmatter, ни в служебном столбце таблиц. Разбор такого
+    файла — чистая трата: на дереве [КК] один проход по 614 страницам стоит 1,4 с
+    разбора против 0,04 с при отборе, а летопись этапа 4 делает такой проход
+    11 026 раз (для каждой задачи заново применяются все ранее принятые).
+
+    Проверка НАМЕРЕННО грубая — подстрока, а не разбор: пропустить файл можно
+    только когда упоминания нет совсем, поэтому ложных пропусков не бывает, а
+    лишний разбор файла, где ID встретился в тексте, безвреден.
+    """
+    return task_id in _read_text_preserving(path)
+
+
 def _run_edit(op: str, task_id: Optional[str], root: Path, status_column: str,
               dry_run: bool) -> int:
     """Общая логика apply/reject/apply-all/reject-all. Возвращает код возврата процесса."""
@@ -950,7 +967,11 @@ def _run_edit(op: str, task_id: Optional[str], root: Path, status_column: str,
     changed_files = 0
     total = 0
     multipass = 0          # файлы, где одного прохода не хватило — сигнал о разметке
+    skipped = 0            # файлы без упоминания задачи — разбирать их нечего
     for fp in files:
+        if task_id is not None and not file_mentions_task(fp, task_id):
+            skipped += 1
+            continue
         try:
             count, passes = process_file_verbose(fp, op, task_id, status_column, dry_run)
         except CriticError as e:
@@ -972,6 +993,9 @@ def _run_edit(op: str, task_id: Optional[str], root: Path, status_column: str,
         # такая, стоит: обычно это блок кода, накрывший маркеры (см. run-critic lint).
         print(f"  из них потребовали нескольких проходов: {multipass} "
               f"(разметка с маркерами внутри блоков кода; подробности — lint)")
+    if skipped:
+        # Прозрачность отбора: видно, что файлы не «потерялись», а не содержали задачу.
+        print(f"  пропущено без упоминания задачи: {skipped}")
     return 0
 
 
