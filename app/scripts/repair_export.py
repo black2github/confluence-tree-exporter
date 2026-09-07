@@ -64,8 +64,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 import yaml
 
 from app.scripts.CI.critic import (
+    STATUS_COLUMN as UNAPPROVED_STATUS_COLUMN,
     TASK_ID_PATTERN, UNAPPROVED_PAGE_KEY, collect_task_occurrences,
-    _INS_RE, _DEL_RE, _OPENERS, _find_table_islands, _split_fenced_regions,
+    _INS_RE, _DEL_RE, _OPENERS, _STATUS_CELL_TAIL_RE, _find_status_part_index,
+    _find_table_islands, _is_separator_row, _is_table_row, _split_fenced_regions,
+    _split_row_parts,
 )
 
 # Маска Jira ID для проверки списка неутверждённых (как в migrate_confluence_tree).
@@ -348,6 +351,77 @@ def set_page_flag(fm_body: str, task: str) -> Tuple[str, bool]:
     return fm_body + new_line, True
 
 
+def name_status_column(text: str, status_column: str = UNAPPROVED_STATUS_COLUMN) -> Tuple[str, int]:
+    """
+    Дать имя служебному столбцу таблиц, где он остался безымянным.
+
+    Экспортёр до 2026-09-06 писал имя `status` только в ряд из <thead>, а выгрузка
+    Confluence держит заголовки в <tbody>: первая строка тела повышалась до шапки
+    вместе со своей пустой служебной ячейкой. Нотация опознаёт табличную правку по
+    ИМЕНИ столбца, поэтому такие таблицы apply/reject пропускают целиком — разметка
+    ±ID доезжает до ПРОМ-среза, а строки «на удаление» не удаляются.
+
+    Две формы, обе чинятся без потери данных:
+      • служебная ячейка шапки пуста  → в неё пишется имя столбца;
+      • шапкой стала САМА размеченная строка → над ней добавляется строка-шапка
+        (пустые подписи + имя столбца) с разделителем, а размеченная строка
+        становится обычной строкой тела.
+    Прочее (ячейка шапки занята текстом) не трогаем: там нужен человек.
+    """
+    lines = text.splitlines(keepends=True)
+    out: List[str] = []
+    fixed = 0
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        nxt = lines[i + 1] if i + 1 < len(lines) else ""
+        # Шапка — строка перед разделителем. Проверка не требует, чтобы строка
+        # НАЧИНАЛАСЬ с '|': в выгрузке шапка бывает завёрнута в inline-маркер
+        # ({++TASK: | № | … |), и именно там прячется самый неудобный случай.
+        if not ("|" in line and _is_separator_row(nxt)
+                and _find_status_part_index(line, status_column) is None):
+            out.append(line)
+            i += 1
+            continue
+
+        sep_parts, _ = _split_row_parts(nxt)         # разделитель задаёт число колонок
+        cells = len(sep_parts) - 2
+        parts, eol = _split_row_parts(line)
+        marked_here = bool(_STATUS_CELL_TAIL_RE.search(line))
+        marked_below = any(_STATUS_CELL_TAIL_RE.search(b) for b in _table_block(lines[i + 2:]))
+
+        if marked_here:
+            # Размечена сама шапка: маркер терять нельзя — шапку добавляем над ней,
+            # а размеченная строка становится обычной строкой тела.
+            head = "|" + "|".join([" "] * (cells - 1) + [" " + status_column + " "]) + "|"
+            sep = "|" + "|".join([" --- "] * cells) + "|"
+            out.append(head + eol)
+            out.append(sep + eol)
+            out.append(line)
+            i += 2                                   # старый разделитель больше не нужен
+            fixed += 1
+            continue
+        if marked_below and len(parts) >= 2 and parts[-2].strip() == "":
+            parts[-2] = " " + status_column + " "
+            out.append("|".join(parts) + eol)
+            i += 1
+            fixed += 1
+            continue
+        out.append(line)
+        i += 1
+    return "".join(out), fixed
+
+
+def _table_block(lines: List[str]) -> List[str]:
+    """Строки одной markdown-таблицы от текущей позиции до первой не-строки таблицы."""
+    block: List[str] = []
+    for l in lines:
+        if not _is_table_row(l):
+            break
+        block.append(l)
+    return block
+
+
 def page_flag_of(fm_body: str) -> Optional[str]:
     """Задача из страничного флага frontmatter, если он уже стоит."""
     m = re.search(r"^" + UNAPPROVED_PAGE_KEY + r":\s*(\S+)", fm_body, re.MULTILINE)
@@ -400,10 +474,12 @@ def load_unapproved_ids(path: Path) -> set:
 
 def repair_file(path: Path, unfold: bool, unapproved: Optional[set],
                 flatten: bool = False, unfence: bool = False,
-                flag_page: Optional[str] = None) -> Dict:
+                flag_page: Optional[str] = None,
+                name_status: bool = False) -> Dict:
     """Починить один файл. Возвращает отчёт; ключ 'changed' — писать ли файл."""
     report: Dict = {"path": path, "unfolded": 0, "flagged": None, "flattened": 0,
-                    "unfenced": 0, "changed": False, "skipped": None, "new_text": None}
+                    "unfenced": 0, "named": 0, "changed": False, "skipped": None,
+                    "new_text": None}
     with open(path, "r", encoding="utf-8", newline="") as f:
         original = f.read()
 
@@ -482,6 +558,11 @@ def repair_file(path: Path, unfold: bool, unapproved: Optional[set],
         new_rest, fenced = unfence_html(new_rest)
         report["unfenced"] = fenced
 
+    if name_status:
+        # Имя служебного столбца — условие, при котором нотация вообще читается.
+        new_rest, named = name_status_column(new_rest)
+        report["named"] = named
+
     if new_fm == fm_body and new_rest == rest:
         return report
 
@@ -515,6 +596,9 @@ def main(argv=None) -> int:
     parser.add_argument("--unfence-html", action="store_true",
                         help="ограждения кода внутри HTML-таблиц заменить на "
                              "<pre> (иначе apply/reject не видят маркеры внутри)")
+    parser.add_argument("--name-status-column", action="store_true",
+                        help="дать имя служебному столбцу таблиц там, где он остался "
+                             "безымянным (иначе apply/reject пропускают таблицу)")
     parser.add_argument("--flag-page", metavar="JIRA-ID",
                         help="проставить страничный флаг unapproved_jira на ВСЕХ "
                              "страницах пути (замороженное поддерево: маркеров в "
@@ -527,9 +611,10 @@ def main(argv=None) -> int:
     args = parser.parse_args(argv)
 
     if not (args.unfold or args.unapproved_jira or args.flatten_nested
-            or args.unfence_html or args.flag_page):
+            or args.unfence_html or args.flag_page or args.name_status_column):
         parser.error("укажите хотя бы одну починку: --unfold, --flatten-nested, "
-                     "--unfence-html, --flag-page и/или --unapproved-jira")
+                     "--unfence-html, --name-status-column, --flag-page "
+                     "и/или --unapproved-jira")
     if args.flag_page and not _TASK_ID_RE.fullmatch(args.flag_page):
         parser.error("--flag-page: %r не похож на Jira ID" % args.flag_page)
 
@@ -562,11 +647,12 @@ def main(argv=None) -> int:
             return 2
 
     changed = unfolded_total = flagged_total = flattened_total = unfenced_total = 0
+    named_total = 0
     skipped: List[Tuple[Path, str]] = []
 
     for path in files:
         rep = repair_file(path, args.unfold, unapproved, args.flatten_nested,
-                          args.unfence_html, args.flag_page)
+                          args.unfence_html, args.flag_page, args.name_status_column)
         if rep["skipped"] and rep["skipped"] != "нет frontmatter":
             skipped.append((path, rep["skipped"]))
         if not rep["changed"]:
@@ -575,6 +661,7 @@ def main(argv=None) -> int:
         unfolded_total += rep["unfolded"]
         flattened_total += rep["flattened"]
         unfenced_total += rep["unfenced"]
+        named_total += rep["named"]
         if rep["flagged"]:
             flagged_total += 1
         what = []
@@ -584,6 +671,8 @@ def main(argv=None) -> int:
             what.append("уплощено маркеров: " + str(rep["flattened"]))
         if rep["unfenced"]:
             what.append("ограждений распаковано: " + str(rep["unfenced"]))
+        if rep["named"]:
+            what.append("столбцов названо: " + str(rep["named"]))
         if rep["flagged"]:
             what.append("флаг " + rep["flagged"])
         prefix = "[dry-run] " if args.dry_run else ""
@@ -601,6 +690,7 @@ def main(argv=None) -> int:
           " (склеено строк " + str(unfolded_total) +
           ", уплощено маркеров " + str(flattened_total) +
           ", ограждений распаковано " + str(unfenced_total) +
+          ", столбцов названо " + str(named_total) +
           ", флагов проставлено " + str(flagged_total) +
           ", пропущено с предупреждением " + str(len(skipped)) + ")")
     return 0

@@ -213,6 +213,58 @@ def find_markers_in_code(text: str) -> List[dict]:
     return found
 
 
+_STATUS_CELL_TAIL_RE = re.compile(r"\|\s*([+-])(" + TASK_ID_PATTERN + r")\s*\|\s*$")
+
+
+def find_unnamed_status_column(text: str, status_column: str = STATUS_COLUMN) -> List[dict]:
+    """
+    Служебные ячейки ±ID в таблице, где столбец не назван `status`.
+
+    Нотация опознаёт табличную правку по ИМЕНИ столбца (ТЗ п. 4.6). Экспортёр до
+    2026-09-06 писал имя только в ряд из <thead>, а выгрузка Confluence держит
+    заголовки в <tbody> — столбец оставался безымянным. Такую таблицу apply и
+    reject пропускают целиком и молчат: разметка ±ID уезжает в ПРОМ-срез, а
+    строки, помеченные на удаление, не удаляются (на дереве [КК] — 10 ячеек на
+    6 страницах, нашлись только по хвосту `critic list`).
+
+    Возвращает записи {line, sign, task, header} — по одной на ячейку.
+    """
+    found: List[dict] = []
+    seen: set = set()                        # номера строк, уже попавших в отчёт
+    for kind, region, base_line in _split_fenced_regions(text):
+        if kind == "code":
+            continue
+        lines = region.splitlines()
+        header_idx = None                    # индекс строки-шапки текущей таблицы
+        for i, line in enumerate(lines):
+            if _is_separator_row(line) and i:
+                header_idx = i - 1
+                head = lines[header_idx]
+                hm = _STATUS_CELL_TAIL_RE.search(head)
+                if (hm and _find_status_part_index(head, status_column) is None
+                        and base_line + header_idx not in seen):
+                    # Размеченная строка сама стала шапкой: её маркер не прочитает
+                    # никто, а имя столбца писать некуда — случай для оператора.
+                    seen.add(base_line + header_idx)
+                    found.append({"line": base_line + header_idx, "sign": hm.group(1),
+                                  "task": hm.group(2), "header": "(маркер в самой шапке)"})
+                continue
+            if not _is_table_row(line):
+                if not line.strip():
+                    header_idx = None        # таблица кончилась
+                continue
+            m = _STATUS_CELL_TAIL_RE.search(line)
+            if not m:
+                continue
+            header = lines[header_idx] if header_idx is not None else ""
+            if _find_status_part_index(header, status_column) is not None:
+                continue                     # столбец назван — всё в порядке
+            seen.add(base_line + i)
+            found.append({"line": base_line + i, "sign": m.group(1),
+                          "task": m.group(2), "header": header.strip()[:120]})
+    return found
+
+
 def _validate_inline(region_text: str, base_line: int, path: Optional[Path]) -> None:
     """Проверяет корректность inline-маркеров в текстовой зоне (ТЗ п. 5.3, п. 6).
 

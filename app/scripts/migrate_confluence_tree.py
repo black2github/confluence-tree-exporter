@@ -255,7 +255,8 @@ def _resolve_page_content(page_data: Dict, include_unapproved: bool, critic: boo
         # этом только на боевом дереве у команды (инцидент 2026-09-05).
         # Не падаем: страница уже собрана, терять её из-за разметки нельзя —
         # предупреждаем и кладём в отчёт как позицию ручного разбора.
-        from app.scripts.CI.critic import find_literal_nesting, find_markers_in_code
+        from app.scripts.CI.critic import (find_literal_nesting, find_markers_in_code,
+                                          find_unnamed_status_column)
         nesting = find_literal_nesting(content)
         for nest in nesting:
             logger.warning(
@@ -266,6 +267,17 @@ def _resolve_page_content(page_data: Dict, include_unapproved: bool, critic: boo
         # байт-в-байт, поэтому apply/reject внутрь не заглядывают — неутверждённое
         # остаётся в «чистом ПРОМ» молча (инцидент 2026-09-06: блок в 20 689
         # символов прятал 65 маркеров).
+        # Третий случай того же класса: служебный столбец таблицы без имени `status`.
+        # Нотация опознаёт табличную правку по имени столбца, поэтому apply/reject
+        # такую таблицу пропускают целиком — разметка ±ID доезжает до ПРОМ-среза,
+        # а строки «на удаление» не удаляются (инцидент 2026-09-06).
+        unnamed = find_unnamed_status_column(content)
+        for cell in unnamed:
+            logger.warning(
+                "  ⚠ '%s': строка %d — служебная ячейка %s%s в таблице без столбца "
+                "status; apply/reject эту таблицу пропустят "
+                "(починка: run-repair --name-status-column)",
+                name, cell["line"], cell["sign"], cell["task"])
         in_code = find_markers_in_code(content)
         for blk in in_code:
             logger.warning(
@@ -280,6 +292,10 @@ def _resolve_page_content(page_data: Dict, include_unapproved: bool, critic: boo
                 critic_acc["literal_nesting"].append(
                     {"page": name, "line": nest["line"],
                      "outer": nest["outer"], "inner": nest["inner"]})
+            for cell in unnamed:
+                critic_acc["unnamed_status"].append(
+                    {"page": name, "line": cell["line"],
+                     "sign": cell["sign"], "task": cell["task"]})
             for blk in in_code:
                 critic_acc["markers_in_code"].append(
                     {"page": name, "line": blk["line"], "chars": blk["chars"],

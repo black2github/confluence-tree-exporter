@@ -426,6 +426,15 @@ class ContentExtractor:
         status_name = self.config.critic_status_column
         total_cols = max_cols + (1 if add_status else 0)
 
+        # Имя служебного столбца пишется в строку-ШАПКУ, а «шапкой» до 2026-09-06
+        # считался только ряд из <thead>. В выгрузке Confluence заголовки лежат
+        # внутри <tbody>, поэтому первая строка тела повышалась до шапки markdown
+        # уже со СВОЕЙ (пустой) служебной ячейкой — столбец оставался безымянным,
+        # critic такую таблицу не опознавал и пропускал целиком: ни apply, ни
+        # reject до строк не добирались, разметка ±ID оставалась в ПРОМ-срезе
+        # (на дереве [КК] так уцелело 10 ячеек на 6 страницах).
+        header_from_body = add_status and not any(rt == "header" for rt, _rd, _st in table_rows)
+
         # Формируем таблицу
         table_lines = []
         has_separator = False
@@ -470,6 +479,22 @@ class ContentExtractor:
             elif row_type == "body":
                 if not has_separator:
                     # Таблица без thead — первая строка становится заголовком
+                    if header_from_body and not status:
+                        # Шапке нужно имя служебного столбца, иначе critic таблицу
+                        # не опознает. Своей разметки у этой строки нет — ячейку
+                        # можно занять именем.
+                        pipe_cells[-1] = status_name
+                        row_line = "| " + " | ".join(pipe_cells) + " |"
+                    elif header_from_body and status:
+                        # Первая строка сама размечена: её маркер терять нельзя,
+                        # поэтому шапку добавляем отдельной строкой, а строку
+                        # оставляем телом таблицы.
+                        head_cells = [""] * (total_cols - 1) + [status_name]
+                        table_lines.append("| " + " | ".join(head_cells) + " |")
+                        table_lines.append(separator_line)
+                        has_separator = True
+                        table_lines.append(row_line)
+                        continue
                     table_lines.append(row_line)
                     table_lines.append(separator_line)
                     has_separator = True
