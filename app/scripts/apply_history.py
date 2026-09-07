@@ -3,11 +3,16 @@
 # Автоматизация этапа 4 роадмапа (летопись): позадачное вливание истории
 # в src-репозиторий (2026-08-10, по запросу пользователя).
 #
-# На каждую задачу из списка выполняется цикл роадмапа:
-#   1) целевой каталог очищается и заново наполняется копией архива (raw);
-#   2) critic apply — для ВСЕХ задач накопительного списка (принятые ранее + текущая);
+# На каждую задачу из списка выполняется цикл роадмапа (с 2026-09-08 — на
+# накопительном дереве «архив + принятые задачи», которое живёт вне репозитория):
+#   1) critic apply текущей задачи в накопительное дерево (один раз на задачу);
+#   2) целевой каталог очищается и наполняется копией накопительного дерева;
 #   3) critic reject-all — «хвост» непринятых задач исключается;
 #   4) git commit среза + git tag <префикс><JIRA-ID>.
+# Прежний способ (--refill-each: пересборка из архива и повторный apply ВСЕХ
+# принятых на каждой итерации) даёт побайтно те же срезы — проверено на всех
+# 148 срезах дерева [КК], — но работы у него квадратично: 11 026 проходов apply
+# против 148. Оставлен ключом для сверки.
 #
 # Автоматизируется «режим без ревью» (коммит прямо в текущую ветку летописи);
 # режим с MR-ревью по природе ручной. Push НЕ выполняется без явного --push.
@@ -157,6 +162,44 @@ def apply_one(repo: Path, raw: Path, target: Path, applied: List[str],
     return True, f"срез {current}: коммит + тег {tag_prefix}{current}{note}"
 
 
+def apply_one_accumulated(repo: Path, base: Path, target: Path, applied: List[str],
+                          tag_prefix: str, rel_target: str) -> Tuple[bool, str]:
+    """Цикл для ОДНОЙ задачи на накопительном дереве (2026-09-07).
+
+    Отличие от apply_one: `base` — дерево «архив + все принятые задачи», которое
+    живёт между итерациями ВНЕ репозитория. Новая задача применяется в него один
+    раз; срез — копия base с reject-all. Результат тот же, что у пересборки из
+    архива с повторным apply всех принятых (apply правит только участки своей
+    задачи, порядок применения на итог не влияет), а работы линейно, а не
+    квадратично: на 148 задачах — 148 проходов apply вместо 11 026.
+    """
+    current = applied[-1]
+    r = _critic(repo, "apply", current, "--path", str(base))
+    if r.returncode != 0:
+        return False, f"critic apply {current}: код {r.returncode}\n{r.stderr[-500:]}"
+    refill_target(base, target)
+    r = _critic(repo, "reject-all", "--path", rel_target)
+    if r.returncode != 0:
+        return False, f"critic reject-all: код {r.returncode}\n{r.stderr[-500:]}"
+
+    _git(repo, "add", "--", rel_target)
+    empty = _git(repo, "diff", "--cached", "--quiet").returncode == 0
+    msg = (f"Срез летописи: {current} (apply поверх ПРОМ + {len(applied) - 1} "
+           f"ранее принятых)")
+    commit_args = ["commit", "-m", msg]
+    note = ""
+    if empty:
+        commit_args.append("--allow-empty")
+        note = " [пустой срез: задача не изменила файлы]"
+    r = _git(repo, *commit_args)
+    if r.returncode != 0:
+        return False, f"git commit: {r.stderr[-500:] or r.stdout[-500:]}"
+    r = _git(repo, "tag", f"{tag_prefix}{current}")
+    if r.returncode != 0:
+        return False, f"git tag: {r.stderr[-500:]}"
+    return True, f"срез {current}: коммит + тег {tag_prefix}{current}{note}"
+
+
 def main(argv: Optional[List[str]] = None) -> int:
     ap = argparse.ArgumentParser(
         description="Этап 4 роадмапа: позадачное вливание истории в src-репозиторий "
@@ -173,6 +216,13 @@ def main(argv: Optional[List[str]] = None) -> int:
                          "(по умолчанию sources/confluence)")
     ap.add_argument("--tag-prefix", default="src/",
                     help="префикс тегов срезов (по умолчанию src/)")
+    ap.add_argument("--refill-each", action="store_true",
+                    help="прежний способ: на каждую задачу пересобирать дерево из архива "
+                         "и заново применять все принятые (квадратично; результат тот же — "
+                         "доказано побайтной сверкой 148 срезов; оставлен для сверки)")
+    ap.add_argument("--base-dir", type=Path, default=None,
+                    help="каталог для накопительного дерева (по умолчанию %%TEMP%%; в "
+                         "контуре укажите каталог вне проверки антивируса и ВНЕ репозитория)")
     ap.add_argument("--dry-run", action="store_true",
                     help="показать план (задачи по порядку) и выйти без изменений")
     ap.add_argument("--push", action="store_true",
@@ -209,11 +259,42 @@ def main(argv: Optional[List[str]] = None) -> int:
             print(f"# ОШИБКА: {e}", file=sys.stderr)
         return 2
 
+    # Накопительное дерево (по умолчанию с 2026-09-08): «архив + принятые задачи»
+    # живёт ВНЕ репозитория — рабочее дерево летописи обязано оставаться чистым
+    # между срезами. Каждая задача применяется в него один раз; срез — копия с
+    # reject-all. Эквивалентность прежнему способу доказана побайтной сверкой всех
+    # 148 срезов дерева [КК]; работы при этом линейно, а не квадратично.
+    base: Optional[Path] = None
+    base_root: Optional[Path] = None
+    if not args.refill_each:
+        if args.base_dir is not None:
+            base_root = args.base_dir.resolve() / "onix-history-base"
+            try:
+                base_root.relative_to(repo.resolve())
+                print("# ОШИБКА: --base-dir внутри репозитория — дерево грязнило бы летопись",
+                      file=sys.stderr)
+                return 2
+            except ValueError:
+                pass
+            if base_root.exists():
+                shutil.rmtree(base_root)
+            base_root.mkdir(parents=True)
+        else:
+            import tempfile
+            base_root = Path(tempfile.mkdtemp(prefix="onix-history-"))
+        base = base_root / "base"
+        shutil.copytree(args.raw, base)
+        print(f"# накопительное дерево: {base}", file=sys.stderr)
+
     applied: List[str] = []
     for i, tid in enumerate(ids, 1):
         applied.append(tid)
-        ok, message = apply_one(repo, args.raw, target, applied,
-                                args.tag_prefix, args.target_subdir)
+        if base is not None:
+            ok, message = apply_one_accumulated(repo, base, target, applied,
+                                                args.tag_prefix, args.target_subdir)
+        else:
+            ok, message = apply_one(repo, args.raw, target, applied,
+                                    args.tag_prefix, args.target_subdir)
         status = "✓" if ok else "✗"
         print(f"# [{i}/{len(ids)}] {status} {message}", file=sys.stderr)
         if not ok:
@@ -223,6 +304,9 @@ def main(argv: Optional[List[str]] = None) -> int:
                   "накопительный; удалите их теги ТОЛЬКО если срезы нужно переделать).",
                   file=sys.stderr)
             return 1
+
+    if base_root is not None:
+        shutil.rmtree(base_root, ignore_errors=True)     # накопительное дерево больше не нужно
 
     # финальный хвост: что осталось непринятым в последнем срезе
     r = _critic(repo, "list", "--path", args.target_subdir)
