@@ -40,6 +40,7 @@ def new_accumulator() -> dict:
         "multi_task_rows": [],        # несколько задач в одной строке истории (4.2.г)
         "literal_nesting": [],        # гейт выхода: маркер проглотил чужой маркер
         "markers_in_code": [],        # гейт выхода: блок кода накрыл маркеры
+        "auto_page_flag": [],         # сторож заморозки: страница целиком за одной задачей
         "unresolved_placeholders": [],
         "nested": [],                 # уплощённые вложенности (ТЗ 4.5) — заполняет вызывающий
         "tasks": {},                  # task_id -> {color, confidence, pages:set, markers}
@@ -140,7 +141,8 @@ def finalize(acc: dict, service: str, migrated_at: str) -> Tuple[dict, dict]:
     positions = (len(acc["unresolved_placeholders"]) + len(acc["collisions"])
                  + len(acc["jira_unextractable"]) + len(acc["nested"])
                  + len(acc["multi_task_rows"]) + len(acc["literal_nesting"])
-                 + len(acc["markers_in_code"]))
+                 + len(acc["markers_in_code"])
+                 + sum(1 for f in acc["auto_page_flag"] if f["kind"] != "поставлен"))
     report = {
         "migrated_at": migrated_at,
         "service": service,
@@ -157,6 +159,7 @@ def finalize(acc: dict, service: str, migrated_at: str) -> Tuple[dict, dict]:
         "multi_task_rows": acc["multi_task_rows"],
         "literal_nesting": acc["literal_nesting"],
         "markers_in_code": acc["markers_in_code"],
+        "auto_page_flag": acc["auto_page_flag"],
         "nested_flattened": acc["nested"],
         "color_summary": sorted(acc["color_summary"],
                                 key=lambda c: (c["color"], -c["count"], c["page"])),
@@ -347,6 +350,17 @@ def render_report_md(report: dict) -> str:
               f"накрыл {c['markers']} маркеров задач {', '.join(c['tasks'])} "
               f"(разобрать вручную либо закрыть страничным флагом unapproved_jira)"
               for c in report.get("markers_in_code", [])])
+
+    # Сторож заморозки: страница, чей состав целиком принадлежит одной задаче,
+    # получает страничный флаг сама — решение «нет в ПРОМ» перестаёт зависеть от
+    # того, вспомнили ли задачу в списке --unapproved-jira.
+    _flags = report.get("auto_page_flag", [])
+    _set = [f for f in _flags if f["kind"] == "поставлен"]
+    _ask = [f for f in _flags if f["kind"] != "поставлен"]
+    _section("Страничный флаг заморозки проставлен автоматически",
+             [f"- «{f['page']}»: {f['tasks'][0]}" for f in _set])
+    _section("Флаг заморозки НЕ проставлен — нужен разбор",
+             [f"- «{f['page']}»: {f['kind']} ({', '.join(f['tasks'])})" for f in _ask])
 
     nested = report.get("nested_flattened", [])
     _by_conf = lambda c: [f"- задачи {n['tasks']} на «{n['page']}»"

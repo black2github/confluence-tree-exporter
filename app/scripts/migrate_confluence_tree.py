@@ -144,6 +144,48 @@ def get_direct_children(page_id: str, use_http: bool = False, retry_count: int =
         return []
 
 
+# Каркас без содержания: теги, разделители markdown-таблиц, пробелы. После отката
+# правки от HTML-острова остаётся пустая обвязка <table><tbody></tbody></table> —
+# для читателя это пустая страница, поэтому в проверке «опустела ли целиком» она
+# за содержимое не считается.
+_STRUCTURE_ONLY_RE = re.compile(r"<[^>]+>|&[a-zA-Z]+;|[|\-:`~*#>\s]+")
+
+
+def decide_page_flag(content_md: str, forced: str = "") -> Tuple[str, Optional[dict]]:
+    """
+    Нужен ли странице флаг заморозки `unapproved_jira` и что сказать в отчёте.
+
+    Правило: если ВЕСЬ состав страницы снимается откатом и принадлежит ОДНОЙ
+    задаче — страница в ПРОМ не входит, флаг ставится по этой задаче. Иначе
+    решение «нет в ПРОМ» живёт только в списке --unapproved-jira, а забытая там
+    задача даёт преждевременный apply неутверждённого в ПРОМ — тихая порча.
+
+    Ограничители (важнее самого срабатывания): несколько задач — угадывать ID
+    нельзя, случай уходит в отчёт; страница пуста или опустела лишь частично —
+    флага нет (чёрный текст = утверждено, ложная заморозка недопустима);
+    уже стоящий флаг не перезаписывается, но расхождение с вычисленным попадает
+    в отчёт.
+
+    Возвращает (флаг, запись отчёта или None).
+    """
+    from app.scripts.CI.critic import collect_task_occurrences, process_text
+
+    auto, note = "", None
+    if content_md.strip():
+        rest, _ = process_text(content_md, "reject", None)
+        if not _STRUCTURE_ONLY_RE.sub("", rest).strip():     # осталась одна обвязка
+            tasks = sorted(collect_task_occurrences(content_md))
+            if len(tasks) == 1:
+                auto = tasks[0]
+            elif len(tasks) > 1 and not forced:
+                # Вопрос имеет смысл, только пока решения нет: если задача названа
+                # списком --unapproved-jira, владелец уже выбрал — молчим.
+                note = {"kind": "несколько задач", "tasks": tasks}
+    if forced and auto and forced != auto:
+        note = {"kind": "расхождение", "tasks": [forced, auto]}
+    return (forced or auto), note
+
+
 def _resolve_page_content(page_data: Dict, include_unapproved: bool, critic: bool,
                           critic_acc: Optional[dict], name: str) -> str:
     """Возвращает markdown-содержимое страницы по выбранному режиму.
@@ -333,11 +375,27 @@ def save_page_file(
     has_unapproved = (page_data.get("full_content") != page_data.get("approved_content")
                       or bool(page_data.get("_forced_unapproved")))
 
+    # Сторож заморозки: если ВЕСЬ состав страницы принадлежит одной задаче, флаг
+    # `unapproved_jira` проставляется сам. Иначе решение «этой страницы нет в ПРОМ»
+    # живёт только в списке --unapproved-jira, и забытая там задача даёт
+    # преждевременный apply неутверждённого в ПРОМ — худший вид тихой порчи.
+    # Записывает ЭКСПОРТЁР, а не reject: флаг обязан лежать в архиве, из которого
+    # опись Doc-as-Code читает `frozen:<ID>`, а reject правит производную копию,
+    # которая пересоздаётся из архива на каждой задаче этапа 4.
+    forced = page_data.get("_forced_unapproved", "") or ""
+    auto_flag, flag_note = ("", None) if not critic else decide_page_flag(content_md, forced)
+    if critic_acc is not None:
+        if flag_note:
+            critic_acc["auto_page_flag"].append({"page": title, **flag_note})
+        elif auto_flag and not forced:
+            critic_acc["auto_page_flag"].append(
+                {"page": title, "kind": "поставлен", "tasks": [auto_flag]})
+
     frontmatter = page_to_frontmatter(
         page, service_code, source, doc_id,
         include_unapproved=include_unapproved or critic,  # критик — полное содержимое
         has_unapproved=has_unapproved,
-        unapproved_jira=page_data.get("_forced_unapproved", "") or "",
+        unapproved_jira=forced or auto_flag,
     )
     write_md_file(filepath, frontmatter, content_md)
 
