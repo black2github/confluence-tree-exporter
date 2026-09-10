@@ -14,8 +14,17 @@
 # 148 срезах дерева [КК], — но работы у него квадратично: 11 026 проходов apply
 # против 148. Оставлен ключом для сверки.
 #
-# Автоматизируется «режим без ревью» (коммит прямо в текущую ветку летописи);
+# Автоматизируется «режим без ревью» (коммит прямо в текущую ветку);
 # режим с MR-ревью по природе ручной. Push НЕ выполняется без явного --push.
+#
+# Модель веток (решение владельца 2026-09-10): основная ветка репозитория
+# сервиса = ПРОМ; коммит скрипта = ВВОД задачи в эксплуатацию (список задач —
+# реально введённые в порядке ввода + вводимая), тег <префикс><JIRA-ID> —
+# момент ввода. Летопись «все задачи по порядку списка» — архивный режим по
+# запросу (--commit-prefix "Срез летописи"), ветка future — снимок apply-all.
+# Служебные файлы экспортёра/доводки (migration-*) — часть архива raw/, в
+# целевой каталог требований НЕ копируются (инцидент: попадали в опись как
+# «страницы без page_id» и «приложения»).
 #
 # Список задач — текстовый файл: понимает и голые JIRA-ID построчно, и блок
 # команд из отчёта migration-apply-order.md («run-critic.bat apply ID --path .»);
@@ -124,15 +133,33 @@ def preflight(repo: Path, raw: Path, target: Path,
     return errors
 
 
+# Служебные файлы экспортёра/доводки в архиве: не требования, в целевой
+# каталог не переносятся (в накопительное дерево — переносятся: критику там
+# доступен манифест).
+SERVICE_FILE_PATTERNS = ("migration-*",)
+
+
 def refill_target(raw: Path, target: Path) -> None:
-    """Очистить целевой каталог и заново наполнить копией архива."""
+    """Очистить целевой каталог и заново наполнить копией архива без
+    служебных файлов (SERVICE_FILE_PATTERNS)."""
     if target.exists():
         shutil.rmtree(target)
-    shutil.copytree(raw, target)
+    shutil.copytree(raw, target,
+                    ignore=shutil.ignore_patterns(*SERVICE_FILE_PATTERNS))
+
+
+DEFAULT_COMMIT_PREFIX = "Ввод в эксплуатацию"
+
+
+def commit_message(prefix: str, current: str, n_prev: int) -> str:
+    """Сообщение коммита среза: префикс задаёт смысл (ввод / архивная летопись),
+    хвост одинаков — задача и число ранее применённых поверх ПРОМ."""
+    return f"{prefix}: {current} (apply поверх ПРОМ + {n_prev} ранее принятых)"
 
 
 def apply_one(repo: Path, raw: Path, target: Path, applied: List[str],
-              tag_prefix: str, rel_target: str) -> Tuple[bool, str]:
+              tag_prefix: str, rel_target: str,
+              commit_prefix: str = DEFAULT_COMMIT_PREFIX) -> Tuple[bool, str]:
     """Цикл роадмапа для ОДНОЙ задачи (последней в applied). (ok, сообщение)."""
     current = applied[-1]
     refill_target(raw, target)
@@ -146,8 +173,7 @@ def apply_one(repo: Path, raw: Path, target: Path, applied: List[str],
 
     _git(repo, "add", "--", rel_target)
     empty = _git(repo, "diff", "--cached", "--quiet").returncode == 0
-    msg = (f"Срез летописи: {current} (apply поверх ПРОМ + {len(applied) - 1} "
-           f"ранее принятых)")
+    msg = commit_message(commit_prefix, current, len(applied) - 1)
     commit_args = ["commit", "-m", msg]
     note = ""
     if empty:
@@ -163,7 +189,8 @@ def apply_one(repo: Path, raw: Path, target: Path, applied: List[str],
 
 
 def apply_one_accumulated(repo: Path, base: Path, target: Path, applied: List[str],
-                          tag_prefix: str, rel_target: str) -> Tuple[bool, str]:
+                          tag_prefix: str, rel_target: str,
+                          commit_prefix: str = DEFAULT_COMMIT_PREFIX) -> Tuple[bool, str]:
     """Цикл для ОДНОЙ задачи на накопительном дереве (2026-09-07).
 
     Отличие от apply_one: `base` — дерево «архив + все принятые задачи», которое
@@ -184,8 +211,7 @@ def apply_one_accumulated(repo: Path, base: Path, target: Path, applied: List[st
 
     _git(repo, "add", "--", rel_target)
     empty = _git(repo, "diff", "--cached", "--quiet").returncode == 0
-    msg = (f"Срез летописи: {current} (apply поверх ПРОМ + {len(applied) - 1} "
-           f"ранее принятых)")
+    msg = commit_message(commit_prefix, current, len(applied) - 1)
     commit_args = ["commit", "-m", msg]
     note = ""
     if empty:
@@ -227,6 +253,10 @@ def main(argv: Optional[List[str]] = None) -> int:
                     help="показать план (задачи по порядку) и выйти без изменений")
     ap.add_argument("--push", action="store_true",
                     help="в конце: git push + push тегов (по умолчанию НЕ пушится)")
+    ap.add_argument("--commit-prefix", default=DEFAULT_COMMIT_PREFIX,
+                    help="префикс сообщения коммита: по умолчанию «Ввод в "
+                         "эксплуатацию» (master = ПРОМ, коммит = ввод задачи); "
+                         "для архивной летописи — «Срез летописи»")
     args = ap.parse_args(argv)
 
     try:
@@ -291,10 +321,12 @@ def main(argv: Optional[List[str]] = None) -> int:
         applied.append(tid)
         if base is not None:
             ok, message = apply_one_accumulated(repo, base, target, applied,
-                                                args.tag_prefix, args.target_subdir)
+                                                args.tag_prefix, args.target_subdir,
+                                                args.commit_prefix)
         else:
             ok, message = apply_one(repo, args.raw, target, applied,
-                                    args.tag_prefix, args.target_subdir)
+                                    args.tag_prefix, args.target_subdir,
+                                    args.commit_prefix)
         status = "✓" if ok else "✗"
         print(f"# [{i}/{len(ids)}] {status} {message}", file=sys.stderr)
         if not ok:
