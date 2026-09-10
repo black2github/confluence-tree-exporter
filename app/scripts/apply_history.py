@@ -50,9 +50,16 @@
 # первое вхождение (порядок значим).
 #
 # Предохранители (асимметрия ошибок — лучше остановиться, чем испортить):
-#   • рабочее дерево репозитория обязано быть чистым до старта;
-#   • целевой каталог обязан лежать ВНУТРИ репозитория и не совпадать с корнем;
-#   • архив (raw) обязан лежать ВНЕ целевого каталога;
+#   • рабочее дерево репозитория обязано быть чистым до старта, HEAD — на ветке;
+#   • целевой каталог обязан лежать ВНУТРИ репозитория, не совпадать с корнем
+#     и не лежать внутри каталога .git;
+#   • архив (raw) обязан лежать ВНЕ целевого каталога; накопительное дерево —
+#     вне репозитория и вне архива;
+#   • имена тегов проверяются заранее (git check-ref-format); вводимые задачи
+#     сверяются с манифестом архива (опечатка в ID — стоп; обход --allow-unlisted);
+#   • git add/diff проверяются по коду возврата; файлы среза, попавшие под
+#     .gitignore репозитория, — стоп (молчаливая потеря вложений недопустима);
+#   • ошибка после наполнения целевого каталога — откат каталога к HEAD;
 #   • тег вводимой задачи уже есть на ветке — задача пропускается с
 #     предупреждением (уже введена); тег есть, но вне ветки — стоп;
 #   • ошибка critic/git на любом шаге — стоп с ненулевым кодом (уже созданные
@@ -82,7 +89,7 @@ def read_task_list(path: Path) -> Tuple[List[str], List[str]]:
     """Список JIRA-ID из файла в порядке следования. Возвращает (ids, warnings)."""
     ids: List[str] = []
     warnings: List[str] = []
-    for line_no, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+    for line_no, line in enumerate(path.read_text(encoding="utf-8-sig").splitlines(), 1):
         s = line.strip()
         if not s or s.startswith("#") or s.upper().startswith("REM "):
             continue
@@ -119,28 +126,31 @@ def _critic(repo: Path, *args: str) -> subprocess.CompletedProcess:
 
 def introduced_tasks(repo: Path, tag_prefix: str) -> List[str]:
     """Задачи, уже введённые на текущей ветке: теги <префикс><JIRA-ID>,
-    достижимые с HEAD, в порядке коммитов (первый ввод — первым). Теги без
-    JIRA-ID в имени (например src/PROM) и теги вне ветки не считаются."""
-    r = _git(repo, "for-each-ref", "--format=%(refname:short) %(*objectname)%(objectname)",
-             f"refs/tags/{tag_prefix}")
+    достижимые с HEAD (в том числе через merge), в порядке коммитов (первый
+    ввод — первым). Аннотированные теги считаются по коммиту, на который
+    указывают. Теги без JIRA-ID в имени (например src/PROM) и теги вне ветки
+    не считаются."""
+    r = _git(repo, "for-each-ref", "--format=%(refname)\t%(objectname)\t%(*objectname)",
+             f"refs/tags/{tag_prefix}*")
     if r.returncode != 0:
         return []
-    by_commit = {}
+    by_commit: dict = {}
     for line in r.stdout.splitlines():
-        parts = line.split()
-        if len(parts) != 2:
+        parts = line.split("\t")
+        if len(parts) != 3:
             continue
-        name, obj = parts
+        refname, obj, peeled = parts
+        name = refname[len("refs/tags/"):]
+        if not name.startswith(tag_prefix):
+            continue
         suffix = name[len(tag_prefix):]
         if not TASK_ID_RE.fullmatch(suffix):
             continue
-        # %(*objectname) — коммит аннотированного тега, иначе пусто и остаётся
-        # objectname лёгкого тега; для лёгкого тега obj = коммит.
-        commit = obj[-40:]
+        commit = peeled.strip() or obj.strip()      # аннотированный → коммит, иначе сам объект
         by_commit.setdefault(commit, []).append(suffix)
     if not by_commit:
         return []
-    order = _git(repo, "rev-list", "--reverse", "--first-parent", "HEAD").stdout.split()
+    order = _git(repo, "rev-list", "--reverse", "HEAD").stdout.split()   # все достижимые
     out: List[str] = []
     for c in order:
         out.extend(sorted(by_commit.get(c, [])))
@@ -148,15 +158,33 @@ def introduced_tasks(repo: Path, tag_prefix: str) -> List[str]:
 
 
 def preflight(repo: Path, raw: Path, target: Path,
-              tag_prefix: str, ids: List[str]) -> List[str]:
+              tag_prefix: str, ids: List[str],
+              manifest: Optional[List[str]] = None,
+              allow_unlisted: bool = False) -> List[str]:
     """Проверки до первого изменения. Возвращает список ошибок (пусто = можно).
-    `ids` — только вводимые задачи (введённые ранее уже отфильтрованы)."""
+    `ids` — только вводимые задачи (введённые ранее уже отфильтрованы);
+    `manifest` — задачи манифеста архива для сверки ID (None/[] — сверки нет)."""
     errors: List[str] = []
     if not raw.is_dir():
         errors.append(f"архив не найден: {raw}")
     if _git(repo, "rev-parse", "--git-dir").returncode != 0:
         errors.append(f"не git-репозиторий: {repo}")
         return errors
+    if _git(repo, "symbolic-ref", "-q", "HEAD").returncode != 0:
+        errors.append("HEAD отсоединён (detached) — переключитесь на ветку: "
+                      "коммиты и теги должны ложиться на ветку")
+    # целевой каталог не внутри .git (rmtree снёс бы репозиторий)
+    for key in ("--git-dir", "--git-common-dir"):
+        g = _git(repo, "rev-parse", key).stdout.strip()
+        if not g:
+            continue
+        gdir = Path(g) if Path(g).is_absolute() else repo / g
+        try:
+            target.resolve().relative_to(gdir.resolve())
+            errors.append(f"целевой каталог внутри каталога git ({gdir}) — запрещено")
+            break
+        except ValueError:
+            pass
     # target строго внутри репозитория и не корень (rmtree!)
     try:
         rel = target.resolve().relative_to(repo.resolve())
@@ -175,10 +203,19 @@ def preflight(repo: Path, raw: Path, target: Path,
         errors.append("рабочее дерево репозитория не чисто — закоммитьте или уберите "
                       "изменения до старта:\n" + st.stdout.strip()[:500])
     for tid in ids:
-        if _git(repo, "rev-parse", "--verify", "--quiet",
-                f"refs/tags/{tag_prefix}{tid}").returncode == 0:
+        ref = f"refs/tags/{tag_prefix}{tid}"
+        if _git(repo, "check-ref-format", ref).returncode != 0:
+            errors.append(f"недопустимое имя тега: {ref} (проверьте --tag-prefix)")
+            continue
+        if _git(repo, "rev-parse", "--verify", "--quiet", ref).returncode == 0:
             errors.append(f"тег уже существует вне текущей ветки: {tag_prefix}{tid} — "
                           f"теги не перезаписываются (задача введена в другой ветке?)")
+    if manifest and not allow_unlisted:
+        unknown = [t for t in ids if t not in manifest]
+        if unknown:
+            errors.append("задач нет в манифесте архива (migration-manifest.yaml): "
+                          + ", ".join(unknown) + " — опечатка в ID? Осознанный ввод "
+                          "задачи вне манифеста: ключ --allow-unlisted")
     return errors
 
 
@@ -219,9 +256,10 @@ def empty_reason(raw: Path, tid: str, introduced: Optional[List[str]] = None) ->
             text = f.read_text(encoding="utf-8", errors="replace")
         except OSError:
             continue
-        if tid not in text:
+        if not re.search(r"(?<![A-Z0-9-])" + re.escape(tid) + r"(?![0-9])", text):
             continue
-        m = _UNAPPROVED_RE.search(text)
+        fm = re.match(r"---\r?\n(.*?)^---", text, re.S | re.M)
+        m = _UNAPPROVED_RE.search(fm.group(1)) if fm else None
         if m and m.group(1) != tid and m.group(1) not in skip:
             owners[m.group(1)] = owners.get(m.group(1), 0) + 1
     if not owners:
@@ -236,17 +274,47 @@ def manifest_tasks(raw: Path) -> List[str]:
     if not mf.is_file():
         return []
     text = mf.read_text(encoding="utf-8", errors="replace")
-    head = text.split("\ntasks:", 1)
-    if len(head) < 2:
+    m = re.search(r"^tasks:\s*$", text, re.M)
+    if not m:
         return []
-    return _MANIFEST_TASK_RE.findall(head[1])
+    return _MANIFEST_TASK_RE.findall(text[m.end():])
+
+
+def _stage_target(repo: Path, rel_target: str) -> Tuple[bool, str, bool]:
+    """git add целевого каталога с проверками: код возврата add, файлы под
+    .gitignore (молчаливая потеря вложений — стоп), код возврата diff.
+    Возвращает (ok, ошибка, индекс_пуст)."""
+    r = _git(repo, "add", "--", rel_target)
+    if r.returncode != 0:
+        return False, f"git add: код {r.returncode}: {r.stderr[-400:]}", False
+    ig = _git(repo, "ls-files", "--others", "--ignored", "--exclude-standard",
+              "--", rel_target)
+    ignored = [x for x in ig.stdout.splitlines() if x.strip()]
+    if ignored:
+        return False, ("файлы среза попадают под .gitignore репозитория и НЕ были бы "
+                       "закоммичены (" + str(len(ignored)) + "): "
+                       + ", ".join(ignored[:5]) + (" …" if len(ignored) > 5 else "")
+                       + " — исправьте .gitignore"), False
+    d = _git(repo, "diff", "--cached", "--quiet")
+    if d.returncode not in (0, 1):
+        return False, f"git diff --cached: код {d.returncode}: {d.stderr[-400:]}", False
+    return True, "", d.returncode == 0
+
+
+def rollback_target(repo: Path, rel_target: str) -> None:
+    """Вернуть целевой каталог к HEAD после ошибки (индекс, tracked, untracked)."""
+    _git(repo, "reset", "-q", "--", rel_target)
+    _git(repo, "checkout", "-q", "--", rel_target)
+    _git(repo, "clean", "-fdq", "--", rel_target)
 
 
 def _commit_target(repo: Path, rel_target: str, msg: str) -> Tuple[bool, str, bool]:
     """git add целевого каталога и коммит, если есть изменения.
     Возвращает (ok, сообщение, был_ли_коммит)."""
-    _git(repo, "add", "--", rel_target)
-    if _git(repo, "diff", "--cached", "--quiet").returncode == 0:
+    ok, err, empty = _stage_target(repo, rel_target)
+    if not ok:
+        return False, err, False
+    if empty:
         return True, "", False
     r = _git(repo, "commit", "-m", msg)
     if r.returncode != 0:
@@ -299,8 +367,9 @@ def apply_one(repo: Path, raw: Path, target: Path, applied: List[str],
     if r.returncode != 0:
         return False, f"critic reject-all: код {r.returncode}\n{r.stderr[-500:]}"
 
-    _git(repo, "add", "--", rel_target)
-    empty = _git(repo, "diff", "--cached", "--quiet").returncode == 0
+    ok, err, empty = _stage_target(repo, rel_target)
+    if not ok:
+        return False, err
     msg = commit_message(commit_prefix, current, len(applied) - 1)
     commit_args = ["commit", "-m", msg]
     note = ""
@@ -339,8 +408,9 @@ def apply_one_accumulated(repo: Path, base: Path, target: Path, applied: List[st
     if r.returncode != 0:
         return False, f"critic reject-all: код {r.returncode}\n{r.stderr[-500:]}"
 
-    _git(repo, "add", "--", rel_target)
-    empty = _git(repo, "diff", "--cached", "--quiet").returncode == 0
+    ok, err, empty = _stage_target(repo, rel_target)
+    if not ok:
+        return False, err
     msg = commit_message(commit_prefix, current, len(applied) - 1)
     commit_args = ["commit", "-m", msg]
     note = ""
@@ -384,6 +454,9 @@ def main(argv: Optional[List[str]] = None) -> int:
     ap.add_argument("--base-dir", type=Path, default=None,
                     help="каталог для накопительного дерева (по умолчанию %%TEMP%%; в "
                          "контуре укажите каталог вне проверки антивируса и ВНЕ репозитория)")
+    ap.add_argument("--allow-unlisted", action="store_true",
+                    help="разрешить ввод задач, которых нет в манифесте архива "
+                         "(по умолчанию — стоп: скорее всего опечатка в ID)")
     ap.add_argument("--dry-run", action="store_true",
                     help="показать план (задачи по порядку) и выйти без изменений")
     ap.add_argument("--push", action="store_true",
@@ -432,7 +505,9 @@ def main(argv: Optional[List[str]] = None) -> int:
     else:
         print(f"# к вводу: {len(ids)}: {', '.join(ids[:8])}"
               f"{' …' if len(ids) > 8 else ''}", file=sys.stderr)
-    errors = preflight(repo, args.raw, target, args.tag_prefix, ids)
+    manifest = manifest_tasks(args.raw) if args.raw.is_dir() else []
+    errors = preflight(repo, args.raw, target, args.tag_prefix, ids,
+                       manifest, args.allow_unlisted)
     if args.dry_run:
         for i, tid in enumerate(ids, 1):
             print(f"#   {i}. {tid} -> commit + tag {args.tag_prefix}{tid} "
@@ -457,104 +532,122 @@ def main(argv: Optional[List[str]] = None) -> int:
     if not args.refill_each:
         if args.base_dir is not None:
             base_root = args.base_dir.resolve() / "onix-history-base"
+            for holder, what in ((repo, "внутри репозитория — дерево грязнило бы хронологию"),
+                                 (args.raw, "внутри архива — архив только для чтения")):
+                try:
+                    base_root.relative_to(holder.resolve())
+                    print(f"# ОШИБКА: --base-dir {what}", file=sys.stderr)
+                    return 2
+                except ValueError:
+                    pass
             try:
-                base_root.relative_to(repo.resolve())
-                print("# ОШИБКА: --base-dir внутри репозитория — дерево грязнило бы хронология",
+                args.raw.resolve().relative_to(base_root)
+                print("# ОШИБКА: архив лежит внутри --base-dir — он был бы удалён",
                       file=sys.stderr)
                 return 2
             except ValueError:
                 pass
-            if base_root.exists():
-                shutil.rmtree(base_root)
-            base_root.mkdir(parents=True)
-        else:
-            import tempfile
-            base_root = Path(tempfile.mkdtemp(prefix="onix-history-"))
-        base = base_root / "base"
-        shutil.copytree(args.raw, base)
-        print(f"# накопительное дерево: {base}", file=sys.stderr)
-        for tid in prior:                    # введённые ранее — в дерево, без коммитов
-            r = _critic(repo, "apply", tid, "--path", str(base))
-            if r.returncode != 0:
-                print(f"# ОШИБКА critic apply {tid} (введена ранее): код {r.returncode}\n"
-                      f"{r.stderr[-500:]}", file=sys.stderr)
-                shutil.rmtree(base_root, ignore_errors=True)
-                return 1
-
-    # Событие «выгрузка»: если «архив + введённые ранее» отличается от вершины
-    # ветки — отдельный коммит без тега, чтобы дифф первой новой задачи был чистым.
-    ok, message, committed = refresh_commit(
-        repo, base if base is not None else args.raw, prior, target,
-        args.target_subdir, source_is_base=base is not None)
-    if not ok:
-        print(f"# ОШИБКА: {message}", file=sys.stderr)
-        if base_root is not None:
-            shutil.rmtree(base_root, ignore_errors=True)
-        return 1
-    if committed:
-        print(f"# событие: {message}", file=sys.stderr)
-    if refresh_only:
-        if base_root is not None:
-            shutil.rmtree(base_root, ignore_errors=True)
-        if not committed:
-            print("# состояние не изменилось: архив тот же, вводов нет — делать нечего.",
-                  file=sys.stderr)
-            return 2
-        print("# готово: выгрузка зафиксирована. Отправка (вручную): git push", file=sys.stderr)
-        return 0
-
-    applied: List[str] = list(prior)
-    for i, tid in enumerate(ids, 1):
-        applied.append(tid)
-        if base is not None:
-            ok, message = apply_one_accumulated(repo, base, target, applied,
-                                                args.tag_prefix, args.target_subdir,
-                                                args.commit_prefix, raw=args.raw)
-        else:
-            ok, message = apply_one(repo, args.raw, target, applied,
-                                    args.tag_prefix, args.target_subdir,
-                                    args.commit_prefix)
-        status = "✓" if ok else "✗"
-        print(f"# [{i}/{len(ids)}] {status} {message}", file=sys.stderr)
-        if not ok:
-            print("# ОСТАНОВ: вводы до этой задачи уже в истории; после исправления "
-                  "запустите снова с тем же списком — введённые задачи скрипт увидит "
-                  "по тегам и пропустит (удаляйте теги ТОЛЬКО если вводы нужно "
-                  "переделать).", file=sys.stderr)
+    try:
+        if not args.refill_each:
             if base_root is not None:
-                shutil.rmtree(base_root, ignore_errors=True)
+                if base_root.exists():
+                    shutil.rmtree(base_root)
+                base_root.mkdir(parents=True)
+            else:
+                import tempfile
+                base_root = Path(tempfile.mkdtemp(prefix="onix-history-"))
+            base = base_root / "base"
+            shutil.copytree(args.raw, base)
+            print(f"# накопительное дерево: {base}", file=sys.stderr)
+            for tid in prior:                # введённые ранее — в дерево, без коммитов
+                r = _critic(repo, "apply", tid, "--path", str(base))
+                if r.returncode != 0:
+                    print(f"# ОШИБКА critic apply {tid} (введена ранее): код {r.returncode}\n"
+                          f"{r.stderr[-500:]}", file=sys.stderr)
+                    return 1
+
+        # Событие «выгрузка»: если «архив + введённые ранее» отличается от вершины
+        # ветки — отдельный коммит без тега, чтобы дифф первой новой задачи был чистым.
+        ok, message, committed = refresh_commit(
+            repo, base if base is not None else args.raw, prior, target,
+            args.target_subdir, source_is_base=base is not None)
+        if not ok:
+            rollback_target(repo, args.target_subdir)
+            print(f"# ОШИБКА: {message}\n# целевой каталог возвращён к HEAD.", file=sys.stderr)
             return 1
+        if committed:
+            print(f"# событие: {message}", file=sys.stderr)
+        if refresh_only:
+            if not committed:
+                print("# состояние не изменилось: архив тот же, вводов нет — делать нечего.",
+                      file=sys.stderr)
+                return 2
+            if args.push:
+                r = _git(repo, "push")
+                if r.returncode != 0:
+                    print(f"# ОШИБКА git push: {r.stderr[-300:]}", file=sys.stderr)
+                    return 1
+                print("# push выполнен (ветка).", file=sys.stderr)
+            else:
+                print("# готово: выгрузка зафиксирована. Отправка (вручную): git push",
+                      file=sys.stderr)
+            return 0
 
-    if base_root is not None:
-        shutil.rmtree(base_root, ignore_errors=True)     # накопительное дерево больше не нужно
-
-    # финальный хвост: задачи манифеста архива, ещё не введённые (critic list
-    # после reject-all всегда пуст — маркеров в целевом каталоге нет)
-    manifest = manifest_tasks(args.raw)
-    if manifest:
-        rest = [t for t in manifest if t not in applied]
-        print(f"# --- не введено (по манифесту архива): {len(rest)} из {len(manifest)} ---",
-              file=sys.stderr)
-        print(("#   " + ", ".join(rest[:20]) + (" …" if len(rest) > 20 else ""))
-              if rest else "# (пусто: все задачи манифеста введены)", file=sys.stderr)
-    else:
-        r = _critic(repo, "list", "--path", args.target_subdir)
-        tail = (r.stdout or "").strip()
-        print("# --- манифеста в архиве нет; critic list по целевому каталогу ---",
-              file=sys.stderr)
-        print(tail if tail else "# (пусто)", file=sys.stderr)
-
-    if args.push:
-        for cmd in (["push"], ["push", "--tags"]):
-            r = _git(repo, *cmd)
-            if r.returncode != 0:
-                print(f"# ОШИБКА git {' '.join(cmd)}: {r.stderr[-300:]}", file=sys.stderr)
+        applied: List[str] = list(prior)
+        created: List[str] = []
+        for i, tid in enumerate(ids, 1):
+            applied.append(tid)
+            if base is not None:
+                ok, message = apply_one_accumulated(repo, base, target, applied,
+                                                    args.tag_prefix, args.target_subdir,
+                                                    args.commit_prefix, raw=args.raw)
+            else:
+                ok, message = apply_one(repo, args.raw, target, applied,
+                                        args.tag_prefix, args.target_subdir,
+                                        args.commit_prefix)
+            status = "✓" if ok else "✗"
+            print(f"# [{i}/{len(ids)}] {status} {message}", file=sys.stderr)
+            if not ok:
+                rollback_target(repo, args.target_subdir)
+                print("# ОСТАНОВ: целевой каталог возвращён к HEAD; вводы до этой задачи "
+                      "уже в истории. После исправления запустите снова с тем же "
+                      "списком — введённые задачи скрипт увидит по тегам и пропустит "
+                      "(удаляйте теги ТОЛЬКО если вводы нужно переделать).",
+                      file=sys.stderr)
                 return 1
-        print("# push выполнен (ветка + теги).", file=sys.stderr)
-    else:
-        print(f"# готово. Отправка на сервер (вручную): git push && git push --tags",
-              file=sys.stderr)
-    return 0
+            created.append(tid)
+
+        # финальный хвост: задачи манифеста архива, ещё не введённые (critic list
+        # после reject-all всегда пуст — маркеров в целевом каталоге нет)
+        if manifest:
+            rest = [t for t in manifest if t not in applied]
+            print(f"# --- не введено (по манифесту архива): {len(rest)} из {len(manifest)} ---",
+                  file=sys.stderr)
+            print(("#   " + ", ".join(rest[:20]) + (" …" if len(rest) > 20 else ""))
+                  if rest else "# (пусто: все задачи манифеста введены)", file=sys.stderr)
+        else:
+            r = _critic(repo, "list", "--path", args.target_subdir)
+            tail = (r.stdout or "").strip()
+            print("# --- манифеста в архиве нет; critic list по целевому каталогу ---",
+                  file=sys.stderr)
+            print(tail if tail else "# (пусто)", file=sys.stderr)
+
+        tag_refs = [f"refs/tags/{args.tag_prefix}{t}" for t in created]
+        if args.push:
+            for cmd in (["push"], ["push", "origin", *tag_refs]):
+                r = _git(repo, *cmd)
+                if r.returncode != 0:
+                    print(f"# ОШИБКА git {' '.join(cmd[:2])}: {r.stderr[-300:]}", file=sys.stderr)
+                    return 1
+            print(f"# push выполнен (ветка + теги этого прогона: {len(tag_refs)}).",
+                  file=sys.stderr)
+        else:
+            print("# готово. Отправка на сервер (вручную): git push && git push origin "
+                  + " ".join(tag_refs), file=sys.stderr)
+        return 0
+    finally:
+        if base_root is not None:
+            shutil.rmtree(base_root, ignore_errors=True)   # накопительное дерево больше не нужно
 
 
 if __name__ == "__main__":
