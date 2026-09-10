@@ -18,10 +18,13 @@
 # режим с MR-ревью по природе ручной. Push НЕ выполняется без явного --push.
 #
 # Модель веток (решение владельца 2026-09-10): основная ветка репозитория
-# сервиса = ПРОМ; коммит скрипта = ВВОД задачи в эксплуатацию (список задач —
-# реально введённые в порядке ввода + вводимая), тег <префикс><JIRA-ID> —
-# момент ввода. Летопись «все задачи по порядку списка» — архивный режим по
-# запросу (--commit-prefix "Срез летописи"), ветка future — снимок apply-all.
+# сервиса = ПРОМ; коммит скрипта = ВВОД задачи в эксплуатацию, тег
+# <префикс><JIRA-ID> — момент ввода. Введённые РАНЕЕ задачи скрипт берёт сам
+# из тегов, достижимых с HEAD, в порядке коммитов ветки (реестр введённых =
+# теги); файл задач содержит только ВВОДИМЫЕ. Порядок ввода произвольный:
+# состояние ветки — множество введённых задач. Летопись «все задачи по
+# порядку списка» — архивный режим по запросу (--commit-prefix "Срез
+# летописи") на репозитории без тегов задач; ветка future — снимок apply-all.
 # Служебные файлы экспортёра/доводки (migration-*) — часть архива raw/, в
 # целевой каталог требований НЕ копируются (инцидент: попадали в опись как
 # «страницы без page_id» и «приложения»).
@@ -35,11 +38,11 @@
 #   • рабочее дерево репозитория обязано быть чистым до старта;
 #   • целевой каталог обязан лежать ВНУТРИ репозитория и не совпадать с корнем;
 #   • архив (raw) обязан лежать ВНЕ целевого каталога;
-#   • существующий тег — стоп (теги летописи не перезаписываются);
+#   • тег вводимой задачи уже есть на ветке — задача пропускается с
+#     предупреждением (уже введена); тег есть, но вне ветки — стоп;
 #   • ошибка critic/git на любом шаге — стоп с ненулевым кодом (уже созданные
-#     срезы остаются в истории, продолжить можно с места остановки, убрав
-#     принятые задачи из списка... точнее — оставив их в НАЧАЛЕ списка: список
-#     накопительный, скрипт сам принимает все предыдущие задачи заново).
+#     срезы остаются в истории; повторный запуск с тем же списком продолжит
+#     с места остановки — введённые задачи он увидит по тегам и пропустит).
 #
 # Пустой срез (задача не изменила ни одного файла) фиксируется коммитом
 # --allow-empty с пометкой: тег обязан существовать для трассировки.
@@ -99,9 +102,40 @@ def _critic(repo: Path, *args: str) -> subprocess.CompletedProcess:
                           encoding="utf-8", errors="replace", env=env)
 
 
+def introduced_tasks(repo: Path, tag_prefix: str) -> List[str]:
+    """Задачи, уже введённые на текущей ветке: теги <префикс><JIRA-ID>,
+    достижимые с HEAD, в порядке коммитов (первый ввод — первым). Теги без
+    JIRA-ID в имени (например src/PROM) и теги вне ветки не считаются."""
+    r = _git(repo, "for-each-ref", "--format=%(refname:short) %(*objectname)%(objectname)",
+             f"refs/tags/{tag_prefix}")
+    if r.returncode != 0:
+        return []
+    by_commit = {}
+    for line in r.stdout.splitlines():
+        parts = line.split()
+        if len(parts) != 2:
+            continue
+        name, obj = parts
+        suffix = name[len(tag_prefix):]
+        if not TASK_ID_RE.fullmatch(suffix):
+            continue
+        # %(*objectname) — коммит аннотированного тега, иначе пусто и остаётся
+        # objectname лёгкого тега; для лёгкого тега obj = коммит.
+        commit = obj[-40:]
+        by_commit.setdefault(commit, []).append(suffix)
+    if not by_commit:
+        return []
+    order = _git(repo, "rev-list", "--reverse", "--first-parent", "HEAD").stdout.split()
+    out: List[str] = []
+    for c in order:
+        out.extend(sorted(by_commit.get(c, [])))
+    return out
+
+
 def preflight(repo: Path, raw: Path, target: Path,
               tag_prefix: str, ids: List[str]) -> List[str]:
-    """Проверки до первого изменения. Возвращает список ошибок (пусто = можно)."""
+    """Проверки до первого изменения. Возвращает список ошибок (пусто = можно).
+    `ids` — только вводимые задачи (введённые ранее уже отфильтрованы)."""
     errors: List[str] = []
     if not raw.is_dir():
         errors.append(f"архив не найден: {raw}")
@@ -128,8 +162,8 @@ def preflight(repo: Path, raw: Path, target: Path,
     for tid in ids:
         if _git(repo, "rev-parse", "--verify", "--quiet",
                 f"refs/tags/{tag_prefix}{tid}").returncode == 0:
-            errors.append(f"тег уже существует: {tag_prefix}{tid} — теги летописи "
-                          f"не перезаписываются (задача уже влита?)")
+            errors.append(f"тег уже существует вне текущей ветки: {tag_prefix}{tid} — "
+                          f"теги не перезаписываются (задача введена в другой ветке?)")
     return errors
 
 
@@ -228,15 +262,17 @@ def apply_one_accumulated(repo: Path, base: Path, target: Path, applied: List[st
 
 def main(argv: Optional[List[str]] = None) -> int:
     ap = argparse.ArgumentParser(
-        description="Этап 4 роадмапа: позадачное вливание истории в src-репозиторий "
-                    "(режим без ревью: коммит в текущую ветку + тег на срез).")
+        description="Этап 4 роадмапа: ввод задач в эксплуатацию в src-репозиторий "
+                    "(режим без ревью: коммит в текущую ветку + тег на ввод; "
+                    "введённые ранее задачи берутся из тегов ветки).")
     ap.add_argument("raw", type=Path,
                     help="каталог архива (нетронутая выгрузка, sources/raw)")
     ap.add_argument("repo", type=Path,
                     help="корень git-репозитория летописи (src-<сервис>)")
     ap.add_argument("tasks", type=Path,
-                    help="файл со списком задач ПО ПОРЯДКУ: голые JIRA-ID построчно "
-                         "или блок команд из migration-apply-order.md")
+                    help="файл со списком ВВОДИМЫХ задач по порядку: голые JIRA-ID "
+                         "построчно или блок команд из migration-apply-order.md "
+                         "(введённые ранее перечислять не нужно — они видны по тегам)")
     ap.add_argument("--target-subdir", default="sources/confluence",
                     help="целевой каталог вливания внутри репозитория "
                          "(по умолчанию sources/confluence)")
@@ -274,16 +310,33 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     repo = args.repo
     target = repo / args.target_subdir
-    print(f"# задач к вливанию: {len(ids)}: {', '.join(ids[:8])}"
+
+    # Введённые ранее — по тегам ветки; задачи из файла, уже введённые, — пропуск.
+    prior = introduced_tasks(repo, args.tag_prefix)
+    print(f"# введено ранее (теги {args.tag_prefix}* на ветке): {len(prior)}"
+          f"{': ' + ', '.join(prior[-8:]) if prior else ''}"
+          f"{' (последние 8)' if len(prior) > 8 else ''}", file=sys.stderr)
+    already = [t for t in ids if t in prior]
+    for t in already:
+        print(f"# ⚠ {t} уже введена (тег {args.tag_prefix}{t}) — пропущена",
+              file=sys.stderr)
+    ids = [t for t in ids if t not in prior]
+    if not ids:
+        print("# нет задач к вводу: все перечисленные уже введены.", file=sys.stderr)
+        return 2
+
+    print(f"# к вводу: {len(ids)}: {', '.join(ids[:8])}"
           f"{' …' if len(ids) > 8 else ''}", file=sys.stderr)
+    errors = preflight(repo, args.raw, target, args.tag_prefix, ids)
     if args.dry_run:
         for i, tid in enumerate(ids, 1):
-            print(f"#   {i}. {tid} -> commit + tag {args.tag_prefix}{tid}",
+            print(f"#   {i}. {tid} -> commit + tag {args.tag_prefix}{tid} "
+                  f"(поверх ПРОМ + {len(prior) + i - 1} ранее принятых)",
                   file=sys.stderr)
+        for e in errors:
+            print(f"# ОШИБКА (preflight): {e}", file=sys.stderr)
         print("# dry-run: изменений не внесено.", file=sys.stderr)
-        return 0
-
-    errors = preflight(repo, args.raw, target, args.tag_prefix, ids)
+        return 2 if errors else 0
     if errors:
         for e in errors:
             print(f"# ОШИБКА: {e}", file=sys.stderr)
@@ -315,8 +368,15 @@ def main(argv: Optional[List[str]] = None) -> int:
         base = base_root / "base"
         shutil.copytree(args.raw, base)
         print(f"# накопительное дерево: {base}", file=sys.stderr)
+        for tid in prior:                    # введённые ранее — в дерево, без коммитов
+            r = _critic(repo, "apply", tid, "--path", str(base))
+            if r.returncode != 0:
+                print(f"# ОШИБКА critic apply {tid} (введена ранее): код {r.returncode}\n"
+                      f"{r.stderr[-500:]}", file=sys.stderr)
+                shutil.rmtree(base_root, ignore_errors=True)
+                return 1
 
-    applied: List[str] = []
+    applied: List[str] = list(prior)
     for i, tid in enumerate(ids, 1):
         applied.append(tid)
         if base is not None:
@@ -330,11 +390,12 @@ def main(argv: Optional[List[str]] = None) -> int:
         status = "✓" if ok else "✗"
         print(f"# [{i}/{len(ids)}] {status} {message}", file=sys.stderr)
         if not ok:
-            print("# ОСТАНОВ: срезы до этой задачи уже в истории; после исправления "
-                  "запустите снова с тем же списком — существующие теги перечислит "
-                  "preflight (уберите влитые задачи из НАЧАЛА списка нельзя — список "
-                  "накопительный; удалите их теги ТОЛЬКО если срезы нужно переделать).",
-                  file=sys.stderr)
+            print("# ОСТАНОВ: вводы до этой задачи уже в истории; после исправления "
+                  "запустите снова с тем же списком — введённые задачи скрипт увидит "
+                  "по тегам и пропустит (удаляйте теги ТОЛЬКО если вводы нужно "
+                  "переделать).", file=sys.stderr)
+            if base_root is not None:
+                shutil.rmtree(base_root, ignore_errors=True)
             return 1
 
     if base_root is not None:
