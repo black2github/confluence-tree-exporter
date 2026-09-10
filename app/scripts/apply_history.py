@@ -1,6 +1,6 @@
 # app/scripts/apply_history.py
 #
-# Автоматизация этапа 4 роадмапа (летопись): позадачное вливание истории
+# Автоматизация этапа 4 роадмапа (хронология): позадачное вливание истории
 # в src-репозиторий (2026-08-10, по запросу пользователя).
 #
 # На каждую задачу из списка выполняется цикл роадмапа (с 2026-09-08 — на
@@ -22,12 +22,26 @@
 # <префикс><JIRA-ID> — момент ввода. Введённые РАНЕЕ задачи скрипт берёт сам
 # из тегов, достижимых с HEAD, в порядке коммитов ветки (реестр введённых =
 # теги); файл задач содержит только ВВОДИМЫЕ. Порядок ввода произвольный:
-# состояние ветки — множество введённых задач. Летопись «все задачи по
+# состояние ветки — множество введённых задач. Хронология «все задачи по
 # порядку списка» — архивный режим по запросу (--commit-prefix "Срез
-# летописи") на репозитории без тегов задач; ветка future — снимок apply-all.
+# хронологии") на репозитории без тегов задач; ветка future — снимок apply-all.
 # Служебные файлы экспортёра/доводки (migration-*) — часть архива raw/, в
 # целевой каталог требований НЕ копируются (инцидент: попадали в опись как
 # «страницы без page_id» и «приложения»).
+#
+# Цепочка событий (решение владельца 2026-09-10): ветка — последовательность
+# событий двух видов, «выгрузка» и «задача». Перед нарезкой новых задач скрипт
+# считает состояние «архив + все введённые ранее» и, если оно отличается от
+# вершины ветки (архив обновлён новой выгрузкой), фиксирует его отдельным
+# коммитом «Выгрузка: …» без тега. Иначе первая новая задача молча получила
+# бы дифф с механической разницей выгрузок. Старые теги не перестраиваются:
+# тег задачи показывает её вклад на момент своей выгрузки, дополнения
+# разметки видны в коммите выгрузки. Хронология на ветке future — тот же
+# скрипт с --tag-prefix hist/ и --commit-prefix "Срез хронологии".
+#
+# Хвост после запуска — задачи манифеста архива (migration-manifest.yaml),
+# ещё не введённые; critic list здесь бесполезен: после reject-all маркеров в
+# целевом каталоге нет по определению.
 #
 # Список задач — текстовый файл: понимает и голые JIRA-ID построчно, и блок
 # команд из отчёта migration-apply-order.md («run-critic.bat apply ID --path .»);
@@ -59,7 +73,7 @@ from typing import List, Optional, Tuple
 TASK_ID_RE = re.compile(r"\b[A-Z][A-Z0-9]{1,19}-\d+\b")
 
 # Корень пакета (каталог, содержащий app/) — сабпроцесс critic запускается из
-# репозитория летописи, и пакет app должен находиться независимо от cwd.
+# репозитория хронологии, и пакет app должен находиться независимо от cwd.
 _PKG_ROOT = Path(__file__).resolve().parents[2]
 
 
@@ -183,10 +197,83 @@ def refill_target(raw: Path, target: Path) -> None:
 
 
 DEFAULT_COMMIT_PREFIX = "Ввод в эксплуатацию"
+REFRESH_PREFIX = "Выгрузка"
+
+_UNAPPROVED_RE = re.compile(r"^unapproved_jira:\s*['\"]?([\w-]+)['\"]?", re.M)
+_MANIFEST_TASK_RE = re.compile(r"^  ([A-Z][A-Z0-9]{1,19}-\d+):\s*$", re.M)
+
+
+def empty_reason(raw: Path, tid: str, introduced: Optional[List[str]] = None) -> str:
+    """Почему ввод задачи не изменил файлы: её страницы (по архиву raw — там
+    маркеры задачи ещё на месте) под флагом ДРУГОЙ, ещё не введённой задачи:
+    страница целиком не в ПРОМ, reject-all опустошает её, вклад задачи проявится
+    с вводом владельца страницы. Пусто = причина иная."""
+    owners: dict = {}
+    skip = set(introduced or ())
+    for f in raw.rglob("*.md"):
+        if f.name.startswith("migration-"):
+            continue
+        try:
+            text = f.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        if tid not in text:
+            continue
+        m = _UNAPPROVED_RE.search(text)
+        if m and m.group(1) != tid and m.group(1) not in skip:
+            owners[m.group(1)] = owners.get(m.group(1), 0) + 1
+    if not owners:
+        return ""
+    parts = ", ".join(f"{k} ({v} стр.)" for k, v in sorted(owners.items()))
+    return f"страницы задачи под флагом ещё не введённой задачи: {parts}"
+
+
+def manifest_tasks(raw: Path) -> List[str]:
+    """Задачи из migration-manifest.yaml архива (порядок файла); [] если нет."""
+    mf = raw / "migration-manifest.yaml"
+    if not mf.is_file():
+        return []
+    text = mf.read_text(encoding="utf-8", errors="replace")
+    head = text.split("\ntasks:", 1)
+    if len(head) < 2:
+        return []
+    return _MANIFEST_TASK_RE.findall(head[1])
+
+
+def _commit_target(repo: Path, rel_target: str, msg: str) -> Tuple[bool, str, bool]:
+    """git add целевого каталога и коммит, если есть изменения.
+    Возвращает (ok, сообщение, был_ли_коммит)."""
+    _git(repo, "add", "--", rel_target)
+    if _git(repo, "diff", "--cached", "--quiet").returncode == 0:
+        return True, "", False
+    r = _git(repo, "commit", "-m", msg)
+    if r.returncode != 0:
+        return False, f"git commit: {r.stderr[-500:] or r.stdout[-500:]}", False
+    return True, msg, True
+
+
+def refresh_commit(repo: Path, source: Path, prior: List[str], target: Path,
+                   rel_target: str, source_is_base: bool) -> Tuple[bool, str, bool]:
+    """Событие «выгрузка»: состояние «архив + введённые ранее» с reject-all.
+    source_is_base — source уже содержит применённые prior (накопительное
+    дерево); иначе source = архив и prior применяются здесь.
+    (ok, сообщение, был_ли_коммит)."""
+    refill_target(source, target)
+    if not source_is_base:
+        for tid in prior:
+            r = _critic(repo, "apply", tid, "--path", rel_target)
+            if r.returncode != 0:
+                return False, f"critic apply {tid} (введена ранее): код {r.returncode}\n{r.stderr[-500:]}", False
+    r = _critic(repo, "reject-all", "--path", rel_target)
+    if r.returncode != 0:
+        return False, f"critic reject-all: код {r.returncode}\n{r.stderr[-500:]}", False
+    msg = (f"{REFRESH_PREFIX}: архив обновлён, состояние пересчитано "
+           f"(ранее принятых: {len(prior)})")
+    return _commit_target(repo, rel_target, msg)
 
 
 def commit_message(prefix: str, current: str, n_prev: int) -> str:
-    """Сообщение коммита среза: префикс задаёт смысл (ввод / архивная летопись),
+    """Сообщение коммита среза: префикс задаёт смысл (ввод / архивная хронология),
     хвост одинаков — задача и число ранее применённых поверх ПРОМ."""
     return f"{prefix}: {current} (apply поверх ПРОМ + {n_prev} ранее принятых)"
 
@@ -212,7 +299,8 @@ def apply_one(repo: Path, raw: Path, target: Path, applied: List[str],
     note = ""
     if empty:
         commit_args.append("--allow-empty")
-        note = " [пустой срез: задача не изменила файлы]"
+        why = empty_reason(raw, current, applied)
+        note = " [пустой срез: задача не изменила файлы" + (f"; {why}" if why else "") + "]"
     r = _git(repo, *commit_args)
     if r.returncode != 0:
         return False, f"git commit: {r.stderr[-500:] or r.stdout[-500:]}"
@@ -224,7 +312,8 @@ def apply_one(repo: Path, raw: Path, target: Path, applied: List[str],
 
 def apply_one_accumulated(repo: Path, base: Path, target: Path, applied: List[str],
                           tag_prefix: str, rel_target: str,
-                          commit_prefix: str = DEFAULT_COMMIT_PREFIX) -> Tuple[bool, str]:
+                          commit_prefix: str = DEFAULT_COMMIT_PREFIX,
+                          raw: Optional[Path] = None) -> Tuple[bool, str]:
     """Цикл для ОДНОЙ задачи на накопительном дереве (2026-09-07).
 
     Отличие от apply_one: `base` — дерево «архив + все принятые задачи», которое
@@ -250,7 +339,8 @@ def apply_one_accumulated(repo: Path, base: Path, target: Path, applied: List[st
     note = ""
     if empty:
         commit_args.append("--allow-empty")
-        note = " [пустой срез: задача не изменила файлы]"
+        why = empty_reason(raw if raw is not None else base, current, applied)
+        note = " [пустой срез: задача не изменила файлы" + (f"; {why}" if why else "") + "]"
     r = _git(repo, *commit_args)
     if r.returncode != 0:
         return False, f"git commit: {r.stderr[-500:] or r.stdout[-500:]}"
@@ -268,11 +358,13 @@ def main(argv: Optional[List[str]] = None) -> int:
     ap.add_argument("raw", type=Path,
                     help="каталог архива (нетронутая выгрузка, sources/raw)")
     ap.add_argument("repo", type=Path,
-                    help="корень git-репозитория летописи (src-<сервис>)")
-    ap.add_argument("tasks", type=Path,
+                    help="корень git-репозитория хронологии (src-<сервис>)")
+    ap.add_argument("tasks", type=Path, nargs="?", default=None,
                     help="файл со списком ВВОДИМЫХ задач по порядку: голые JIRA-ID "
                          "построчно или блок команд из migration-apply-order.md "
-                         "(введённые ранее перечислять не нужно — они видны по тегам)")
+                         "(введённые ранее перечислять не нужно — они видны по тегам). "
+                         "Без файла — только событие «выгрузка»: состояние «архив + "
+                         "введённые ранее» пересчитывается и фиксируется коммитом")
     ap.add_argument("--target-subdir", default="sources/confluence",
                     help="целевой каталог вливания внутри репозитория "
                          "(по умолчанию sources/confluence)")
@@ -292,7 +384,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     ap.add_argument("--commit-prefix", default=DEFAULT_COMMIT_PREFIX,
                     help="префикс сообщения коммита: по умолчанию «Ввод в "
                          "эксплуатацию» (master = ПРОМ, коммит = ввод задачи); "
-                         "для архивной летописи — «Срез летописи»")
+                         "для хронологии на ветке future — «Срез хронологии» "
+                         "(вместе с --tag-prefix hist/)")
     args = ap.parse_args(argv)
 
     try:
@@ -301,12 +394,16 @@ def main(argv: Optional[List[str]] = None) -> int:
     except ImportError:
         pass
 
-    ids, warnings = read_task_list(args.tasks)
-    for w in warnings:
-        print(f"# ⚠ {w}", file=sys.stderr)
-    if not ids:
-        print("# ОШИБКА: в файле задач не найдено ни одного JIRA-ID.", file=sys.stderr)
-        return 2
+    if args.tasks is None:
+        ids, warnings = [], []
+        print("# файл задач не задан: только событие «выгрузка» (без вводов)", file=sys.stderr)
+    else:
+        ids, warnings = read_task_list(args.tasks)
+        for w in warnings:
+            print(f"# ⚠ {w}", file=sys.stderr)
+        if not ids:
+            print("# ОШИБКА: в файле задач не найдено ни одного JIRA-ID.", file=sys.stderr)
+            return 2
 
     repo = args.repo
     target = repo / args.target_subdir
@@ -321,12 +418,13 @@ def main(argv: Optional[List[str]] = None) -> int:
         print(f"# ⚠ {t} уже введена (тег {args.tag_prefix}{t}) — пропущена",
               file=sys.stderr)
     ids = [t for t in ids if t not in prior]
-    if not ids:
-        print("# нет задач к вводу: все перечисленные уже введены.", file=sys.stderr)
-        return 2
-
-    print(f"# к вводу: {len(ids)}: {', '.join(ids[:8])}"
-          f"{' …' if len(ids) > 8 else ''}", file=sys.stderr)
+    refresh_only = not ids
+    if refresh_only:
+        print("# задач к вводу нет" + (": все перечисленные уже введены" if already else "")
+              + " — только событие «выгрузка».", file=sys.stderr)
+    else:
+        print(f"# к вводу: {len(ids)}: {', '.join(ids[:8])}"
+              f"{' …' if len(ids) > 8 else ''}", file=sys.stderr)
     errors = preflight(repo, args.raw, target, args.tag_prefix, ids)
     if args.dry_run:
         for i, tid in enumerate(ids, 1):
@@ -343,7 +441,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         return 2
 
     # Накопительное дерево (по умолчанию с 2026-09-08): «архив + принятые задачи»
-    # живёт ВНЕ репозитория — рабочее дерево летописи обязано оставаться чистым
+    # живёт ВНЕ репозитория — рабочее дерево хронологии обязано оставаться чистым
     # между срезами. Каждая задача применяется в него один раз; срез — копия с
     # reject-all. Эквивалентность прежнему способу доказана побайтной сверкой всех
     # 148 срезов дерева [КК]; работы при этом линейно, а не квадратично.
@@ -354,7 +452,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             base_root = args.base_dir.resolve() / "onix-history-base"
             try:
                 base_root.relative_to(repo.resolve())
-                print("# ОШИБКА: --base-dir внутри репозитория — дерево грязнило бы летопись",
+                print("# ОШИБКА: --base-dir внутри репозитория — дерево грязнило бы хронология",
                       file=sys.stderr)
                 return 2
             except ValueError:
@@ -376,13 +474,35 @@ def main(argv: Optional[List[str]] = None) -> int:
                 shutil.rmtree(base_root, ignore_errors=True)
                 return 1
 
+    # Событие «выгрузка»: если «архив + введённые ранее» отличается от вершины
+    # ветки — отдельный коммит без тега, чтобы дифф первой новой задачи был чистым.
+    ok, message, committed = refresh_commit(
+        repo, base if base is not None else args.raw, prior, target,
+        args.target_subdir, source_is_base=base is not None)
+    if not ok:
+        print(f"# ОШИБКА: {message}", file=sys.stderr)
+        if base_root is not None:
+            shutil.rmtree(base_root, ignore_errors=True)
+        return 1
+    if committed:
+        print(f"# выгрузка: {message}", file=sys.stderr)
+    if refresh_only:
+        if base_root is not None:
+            shutil.rmtree(base_root, ignore_errors=True)
+        if not committed:
+            print("# состояние не изменилось: архив тот же, вводов нет — делать нечего.",
+                  file=sys.stderr)
+            return 2
+        print("# готово: выгрузка зафиксирована. Отправка (вручную): git push", file=sys.stderr)
+        return 0
+
     applied: List[str] = list(prior)
     for i, tid in enumerate(ids, 1):
         applied.append(tid)
         if base is not None:
             ok, message = apply_one_accumulated(repo, base, target, applied,
                                                 args.tag_prefix, args.target_subdir,
-                                                args.commit_prefix)
+                                                args.commit_prefix, raw=args.raw)
         else:
             ok, message = apply_one(repo, args.raw, target, applied,
                                     args.tag_prefix, args.target_subdir,
@@ -401,11 +521,21 @@ def main(argv: Optional[List[str]] = None) -> int:
     if base_root is not None:
         shutil.rmtree(base_root, ignore_errors=True)     # накопительное дерево больше не нужно
 
-    # финальный хвост: что осталось непринятым в последнем срезе
-    r = _critic(repo, "list", "--path", args.target_subdir)
-    tail = (r.stdout or "").strip()
-    print("# --- хвост (непринятые задачи в последнем срезе) ---", file=sys.stderr)
-    print(tail if tail else "# (пусто)", file=sys.stderr)
+    # финальный хвост: задачи манифеста архива, ещё не введённые (critic list
+    # после reject-all всегда пуст — маркеров в целевом каталоге нет)
+    manifest = manifest_tasks(args.raw)
+    if manifest:
+        rest = [t for t in manifest if t not in applied]
+        print(f"# --- не введено (по манифесту архива): {len(rest)} из {len(manifest)} ---",
+              file=sys.stderr)
+        print(("#   " + ", ".join(rest[:20]) + (" …" if len(rest) > 20 else ""))
+              if rest else "# (пусто: все задачи манифеста введены)", file=sys.stderr)
+    else:
+        r = _critic(repo, "list", "--path", args.target_subdir)
+        tail = (r.stdout or "").strip()
+        print("# --- манифеста в архиве нет; critic list по целевому каталогу ---",
+              file=sys.stderr)
+        print(tail if tail else "# (пусто)", file=sys.stderr)
 
     if args.push:
         for cmd in (["push"], ["push", "--tags"]):
