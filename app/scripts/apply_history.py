@@ -33,7 +33,8 @@
 # событий двух видов, «выгрузка» и «задача». Перед нарезкой новых задач скрипт
 # считает состояние «архив + все введённые ранее» и, если оно отличается от
 # вершины ветки (архив обновлён новой выгрузкой), фиксирует его отдельным
-# коммитом «Выгрузка: …» без тега. Иначе первая новая задача молча получила
+# коммитом «Выгрузка: …» без тега; когда целевого каталога в ветке ещё нет,
+# это первый сбор ПРОМ (этап 3 роадмапа) — коммит «ПРОМ-срез: …». Иначе первая новая задача молча получила
 # бы дифф с механической разницей выгрузок. Старые теги не перестраиваются:
 # тег задачи показывает её вклад на момент своей выгрузки, дополнения
 # разметки видны в коммите выгрузки. Хронология на ветке future — тот же
@@ -198,6 +199,7 @@ def refill_target(raw: Path, target: Path) -> None:
 
 DEFAULT_COMMIT_PREFIX = "Ввод в эксплуатацию"
 REFRESH_PREFIX = "Выгрузка"
+FIRST_PREFIX = "ПРОМ-срез"
 
 _UNAPPROVED_RE = re.compile(r"^unapproved_jira:\s*['\"]?([\w-]+)['\"]?", re.M)
 _MANIFEST_TASK_RE = re.compile(r"^  ([A-Z][A-Z0-9]{1,19}-\d+):\s*$", re.M)
@@ -258,6 +260,7 @@ def refresh_commit(repo: Path, source: Path, prior: List[str], target: Path,
     source_is_base — source уже содержит применённые prior (накопительное
     дерево); иначе source = архив и prior применяются здесь.
     (ok, сообщение, был_ли_коммит)."""
+    first = not target.exists()          # этап 3 роадмапа: первый сбор ПРОМ
     refill_target(source, target)
     if not source_is_base:
         for tid in prior:
@@ -267,8 +270,12 @@ def refresh_commit(repo: Path, source: Path, prior: List[str], target: Path,
     r = _critic(repo, "reject-all", "--path", rel_target)
     if r.returncode != 0:
         return False, f"critic reject-all: код {r.returncode}\n{r.stderr[-500:]}", False
-    msg = (f"{REFRESH_PREFIX}: архив обновлён, состояние пересчитано "
-           f"(ранее принятых: {len(prior)})")
+    if first:
+        msg = (f"{FIRST_PREFIX}: {rel_target} собран из архива, непринятые правки "
+               f"отклонены (ранее принятых: {len(prior)})")
+    else:
+        msg = (f"{REFRESH_PREFIX}: архив обновлён, состояние пересчитано "
+               f"(ранее принятых: {len(prior)})")
     return _commit_target(repo, rel_target, msg)
 
 
@@ -485,7 +492,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             shutil.rmtree(base_root, ignore_errors=True)
         return 1
     if committed:
-        print(f"# выгрузка: {message}", file=sys.stderr)
+        print(f"# событие: {message}", file=sys.stderr)
     if refresh_only:
         if base_root is not None:
             shutil.rmtree(base_root, ignore_errors=True)
