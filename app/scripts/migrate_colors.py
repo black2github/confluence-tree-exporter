@@ -42,6 +42,7 @@ def new_accumulator() -> dict:
         "markers_in_code": [],        # гейт выхода: блок кода накрыл маркеры
         "unnamed_status": [],         # гейт выхода: служебный столбец без имени status
         "auto_page_flag": [],         # сторож заморозки: страница целиком за одной задачей
+        "forced_skipped": [],         # задача из списка не первая в истории: форса нет
         "unresolved_placeholders": [],
         "nested": [],                 # уплощённые вложенности (ТЗ 4.5) — заполняет вызывающий
         "tasks": {},                  # task_id -> {color, confidence, pages:set, markers}
@@ -143,7 +144,8 @@ def finalize(acc: dict, service: str, migrated_at: str) -> Tuple[dict, dict]:
                  + len(acc["jira_unextractable"]) + len(acc["nested"])
                  + len(acc["multi_task_rows"]) + len(acc["literal_nesting"])
                  + len(acc["markers_in_code"]) + len(acc["unnamed_status"])
-                 + sum(1 for f in acc["auto_page_flag"] if f["kind"] != "поставлен"))
+                 + sum(1 for f in acc["auto_page_flag"] if f["kind"] != "поставлен")
+                 + len(acc.get("forced_skipped", [])))
     report = {
         "migrated_at": migrated_at,
         "service": service,
@@ -162,6 +164,7 @@ def finalize(acc: dict, service: str, migrated_at: str) -> Tuple[dict, dict]:
         "markers_in_code": acc["markers_in_code"],
         "unnamed_status": acc["unnamed_status"],
         "auto_page_flag": acc["auto_page_flag"],
+        "forced_skipped": acc.get("forced_skipped", []),
         "nested_flattened": acc["nested"],
         "color_summary": sorted(acc["color_summary"],
                                 key=lambda c: (c["color"], -c["count"], c["page"])),
@@ -369,6 +372,14 @@ def render_report_md(report: dict) -> str:
              [f"- «{f['page']}»: {f['tasks'][0]}" for f in _set])
     _section("Флаг заморозки НЕ проставлен — нужен разбор",
              [f"- «{f['page']}»: {f['kind']} ({', '.join(f['tasks'])})" for f in _ask])
+
+    # Страница замораживается целиком, только если создана задачей из списка
+    # (первая по дате запись истории). Иначе её чёрный текст уже в ПРОМ, а
+    # чёрные правки самой задачи неотличимы — остаются, нужен разбор руками.
+    _section("Задача из списка --unapproved-jira есть в истории, но страница НЕ "
+             "заморожена — её чёрные правки останутся в ПРОМ, нужен разбор",
+             [f"- «{f['page']}»: {f['kind']} ({', '.join(f['tasks'])})"
+              for f in report.get("forced_skipped", [])])
 
     nested = report.get("nested_flattened", [])
     _by_conf = lambda c: [f"- задачи {n['tasks']} на «{n['page']}»"

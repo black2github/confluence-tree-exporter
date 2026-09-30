@@ -295,49 +295,122 @@ class ForcedUnapproved:
     first_seen: Optional[Tuple[int, int, int]] = None
 
 
-def find_forced_unapproved(raw_html: str, unapproved_ids) -> Optional[ForcedUnapproved]:
-    """Джиры ЧЁРНЫХ строк истории ∈ списку неутверждённых → форс-режим страницы.
+@dataclass
+class ForcedDecision:
+    """Решение по форс-режиму страницы и замечания для отчёта.
 
-    Возвращает ForcedUnapproved или None (страница живёт по обычным правилам).
-    При нескольких совпавших джирах берётся строка с самой поздней датой —
-    симметрично разрешению коллизий цветов (ТЗ п. 4.2.е), с предупреждением.
-    Страницы без опознанной истории не покрываются (риск принят: команды чистят
-    страницы к переезду)."""
+    forced — None, если страница живёт по обычным правилам. notes — случаи,
+    когда задача из списка в истории ЕСТЬ, но страница НЕ заморожена: их надо
+    показать владельцу, иначе чёрный текст такой задачи молча останется в ПРОМ.
+    Элемент notes: {"kind": <причина>, "tasks": [<задачи из списка>]}."""
+    forced: Optional[ForcedUnapproved] = None
+    notes: List[dict] = field(default_factory=list)
+
+
+def _history_direction(dates: List[Optional[Tuple[int, int, int]]]) -> int:
+    """Направление сортировки истории по датированным строкам:
+    +1 — от старых к новым, -1 — от новых к старым, 0 — не определяется."""
+    known = [d for d in dates if d]
+    if len(set(known)) < 2:
+        return 0
+    if all(a <= b for a, b in zip(known, known[1:])):
+        return 1
+    if all(a >= b for a, b in zip(known, known[1:])):
+        return -1
+    return 0
+
+
+def decide_forced_unapproved(raw_html: str, unapproved_ids) -> ForcedDecision:
+    """Страница родилась неутверждённой задачей → форс-режим страницы.
+
+    Правило (решение владельца 2026-09-30): страница замораживается целиком,
+    только если задача из списка стоит в ПЕРВОЙ по дате записи истории, и эта
+    запись чёрная — то есть страница создана этой задачей. До правки хватало
+    любой чёрной строки: задача из списка в середине истории чужой страницы
+    замораживала её целиком, и reject-all оставлял от неё один frontmatter —
+    молчаливая потеря требований, введённых в ПРОМ раньше.
+
+    Края (в каждом — без форса и с замечанием в отчёт, если задача из списка
+    в чёрных строках есть):
+      1. у первой даты несколько чёрных строк, часть задач не из списка —
+         неясно, кто создал страницу;
+      2. первая запись без даты: берётся порядок строк таблицы по направлению
+         сортировки остальных дат; направление не определяется — без форса;
+      3. первая запись цветная — страница живёт по карте цветов;
+      4. задача из списка не в первой записи.
+    Цветные строки с датой первой записи форсу не мешают: требования под
+    цветом добавлены позже, пусть и в тот же день.
+
+    При форсе и нескольких задачах из списка состав метится последней по дате
+    (прежнее решение, симметрично ТЗ п. 4.2.е), с предупреждением.
+    Страницы без опознанной истории не покрываются (риск принят)."""
+    decision = ForcedDecision()
     unapproved = {u.strip() for u in unapproved_ids if u and u.strip()}
     if not unapproved:
-        return None
+        return decision
 
     soup = BeautifulSoup(raw_html, "html.parser")
     table = find_history_table(soup)
     if table is None:
-        return None
+        return decision
     roles, header_row = _identify_columns(table)
     if "description" not in roles or "jira" not in roles:
-        return None
+        return decision
 
     di, ji = roles["description"], roles["jira"]
     dti = roles.get("date")
 
-    matched: List[Tuple[str, Optional[Tuple[int, int, int]]]] = []
+    # строки истории в порядке таблицы: (дата, цветная, задачи)
+    rows: List[Tuple[Optional[Tuple[int, int, int]], bool, List[str]]] = []
     for row in table.find_all("tr"):
         if row is header_row:
             continue
         cells = row.find_all(["th", "td"], recursive=False)
         if max(di, ji, dti if dti is not None else 0) >= len(cells):
             continue
-        if _extract_row_colors(cells[di]):
-            continue          # цветная строка — обрабатывается картой цветов
-        date = _extract_date(cells[dti]) if dti is not None else None
-        for task_id in _resolve_jira_ids(cells[ji]):
-            if task_id in unapproved:
-                matched.append((task_id, date))
+        rows.append((_extract_date(cells[dti]) if dti is not None else None,
+                     bool(_extract_row_colors(cells[di])),
+                     _resolve_jira_ids(cells[ji])))
 
+    # задачи из списка в ЧЁРНЫХ строках (цветные обрабатывает карта цветов)
+    matched = [(t, d) for d, colored, tasks in rows if not colored
+               for t in tasks if t in unapproved]
     if not matched:
-        return None
+        return decision
+    distinct = sorted({t for t, _d in matched})
+
+    def _skip(kind: str) -> ForcedDecision:
+        decision.notes.append({"kind": kind, "tasks": distinct})
+        return decision
+
+    # --- первая запись истории ---
+    dates = [d for d, _c, _t in rows]
+    if len(rows) == 1:
+        origin = rows
+    elif all(dates):
+        first = min(dates)
+        origin = [r for r in rows if r[0] == first]
+    else:
+        direction = _history_direction(dates)
+        if direction == 0:
+            return _skip("первая запись истории не определяется "
+                         "(есть записи без даты, порядок таблицы неясен)")
+        head = rows[0] if direction > 0 else rows[-1]
+        origin = [head] if head[0] is None else [r for r in rows if r[0] == head[0]]
+
+    black = [tasks for _d, colored, tasks in origin if not colored]
+    if not black:
+        return _skip("первая запись истории цветная, задача из списка — в более "
+                     "поздней чёрной записи")
+    origin_tasks = {t for tasks in black for t in tasks}
+    if not (origin_tasks & unapproved):
+        return _skip("задача из списка не в первой записи истории")
+    if (origin_tasks - unapproved) or any(not tasks for tasks in black):
+        return _skip("у первой даты истории несколько чёрных записей, не все "
+                     "задачи из списка")
 
     matched.sort(key=lambda m: m[1] or (0, 0, 0))
     chosen = matched[-1][0]
-    distinct = sorted({t for t, _d in matched})
     chosen_dates = [d for t, d in matched if t == chosen and d]
     result = ForcedUnapproved(task=chosen, candidates=distinct,
                               first_seen=min(chosen_dates) if chosen_dates else None)
@@ -345,7 +418,13 @@ def find_forced_unapproved(raw_html: str, unapproved_ids) -> Optional[ForcedUnap
         result.warnings.append(
             f"несколько неутверждённых задач в чёрных строках истории {distinct} — "
             f"состав помечен последней по дате: {chosen}")
-    return result
+    decision.forced = result
+    return decision
+
+
+def find_forced_unapproved(raw_html: str, unapproved_ids) -> Optional[ForcedUnapproved]:
+    """Форс-режим страницы или None; правило и края — decide_forced_unapproved."""
+    return decide_forced_unapproved(raw_html, unapproved_ids).forced
 
 
 def build_color_task_map(raw_html: str) -> HistoryMapResult:

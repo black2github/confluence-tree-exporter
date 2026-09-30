@@ -204,9 +204,17 @@ def _resolve_page_content(page_data: Dict, include_unapproved: bool, critic: boo
     import app.config as _config
     forced = None
     if _config.UNAPPROVED_JIRA_IDS:
-        from app.color_map import find_forced_unapproved
-        forced = find_forced_unapproved(
+        from app.color_map import decide_forced_unapproved
+        decision = decide_forced_unapproved(
             page_data.get("raw_html", "") or "", _config.UNAPPROVED_JIRA_IDS)
+        forced = decision.forced
+        # Задача из списка в истории есть, но страница создана не ею — форса нет
+        # (2026-09-30). В отчёт: чёрный текст такой задачи останется в ПРОМ.
+        for note in decision.notes:
+            logger.warning("  ⚠ '%s': задача из списка --unapproved-jira %s — страница "
+                           "НЕ заморожена: %s", name, note["tasks"], note["kind"])
+            if critic_acc is not None:
+                critic_acc["forced_skipped"].append({"page": name, **note})
         if forced:
             page_data["_forced_unapproved"] = forced.task
             for w in forced.warnings:
