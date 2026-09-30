@@ -2,7 +2,7 @@
 
 import logging
 import re
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 from bs4 import BeautifulSoup, Tag, NavigableString, Comment
 from dataclasses import dataclass, field
 from app.utils.style_utils import (
@@ -853,6 +853,14 @@ class ContentExtractor:
                 # не оборачиваем целиком, спускаемся внутрь (иначе маркер на ПРОМ-тексте).
                 if not self._element_effectively_colored(element, outer_norm):
                     return self._dispatch_element(element, context)
+                # Смешанное зачёркивание (2026-09-30): цветной элемент, в котором
+                # зачёркнута лишь ЧАСТЬ текста (<span color>В пол<s>е</s>ях</span>),
+                # — это две правки одной задачи: удаление «е» и вставка «ях».
+                # `_is_strikethrough` истинен для элемента, лишь СОДЕРЖАЩЕГО <s>,
+                # и целиком помечал его удалением: {--еях--} — apply терял «ях»
+                # (страница «Запрос openApi»). Режем по зачёркнутости.
+                if kind == "del" and not self._is_fully_struck(element):
+                    return self._split_mixed_strike(element, task, context)
                 self._critic_stack.append(task)
                 try:
                     inner = self._dispatch_element(element, context)
@@ -860,6 +868,48 @@ class ContentExtractor:
                     self._critic_stack.pop()
                 return self._wrap_critic(task, kind, inner)
         return self._dispatch_element(element, context)
+
+    def _split_mixed_strike(self, element: Tag, task: str, context: str) -> str:
+        """Цветной элемент с частично зачёркнутым текстом → чередование маркеров
+        {--…--} (зачёркнутые потомки) и {++…++} (остальные) одной задачи.
+
+        Потомок, в котором зачёркнутое и незачёркнутое снова перемешаны, режется
+        рекурсивно (его собственный тег-обёртка при этом не воспроизводится).
+        Вложенная разметка маркерами подавляется стеком, как при целой обёртке.
+        """
+        runs: List[Tuple[str, str]] = []   # (kind, отрендеренный кусок)
+
+        def add(kind: str, piece: Optional[str]) -> None:
+            if not piece:
+                return
+            if runs and runs[-1][0] == kind:
+                runs[-1] = (kind, runs[-1][1] + piece)
+            else:
+                runs.append((kind, piece))
+
+        self._critic_stack.append(task)
+        try:
+            for child in element.children:
+                if isinstance(child, NavigableString):
+                    if isinstance(child, Comment):
+                        continue
+                    add("ins", self._process_text_node(str(child), context))
+                elif isinstance(child, Tag):
+                    if self._is_ignored_element(child):
+                        continue
+                    if self._is_fully_struck(child):
+                        add("del", self._process_element(child, context))
+                    elif self._is_strikethrough(child):
+                        add("mixed", self._split_mixed_strike(child, task, context))
+                    else:
+                        add("ins", self._process_element(child, context))
+        finally:
+            self._critic_stack.pop()
+
+        out = []
+        for kind, piece in runs:
+            out.append(piece if kind == "mixed" else self._wrap_critic(task, kind, piece))
+        return "".join(out)
 
     def _element_effectively_colored(self, element: Tag, own_norm: Optional[str]) -> bool:
         """True, если хотя бы у одного текстового прогона внутри element ЭФФЕКТИВНЫЙ
@@ -1208,7 +1258,8 @@ class ContentExtractor:
         """
         colors = set()
         has_plain = False
-        struck = False
+        struck_nodes = 0
+        edit_nodes = 0
         for text_node in cell.find_all(string=True):
             if not str(text_node).strip():
                 continue
@@ -1229,15 +1280,20 @@ class ContentExtractor:
                 has_plain = True   # чёрный/near-black/UI/бесцветный — не правка
             else:
                 colors.add(normalize_color(color))
+                edit_nodes += 1
                 if strike:
-                    struck = True
+                    struck_nodes += 1
         if has_plain or len(colors) != 1:
+            return None
+        # Зачёркнута лишь часть текста — это не удаление ячейки целиком, а две
+        # правки внутри неё (удаление + вставка): размечаются inline (2026-09-30).
+        if 0 < struck_nodes < edit_nodes:
             return None
         norm = colors.pop()
         if not norm:
             return None
         task = self.config.color_map.get(norm) or ("UNKNOWN-" + norm.lstrip("#"))
-        return task, ("del" if struck else "ins")
+        return task, ("del" if struck_nodes else "ins")
 
     def _row_uniform_critic(self, row: Tag):
         """Возвращает (task, kind), если ВСЕ непустые ячейки строки — одна целостная правка."""
