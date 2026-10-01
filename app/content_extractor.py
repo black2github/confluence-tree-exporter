@@ -2316,6 +2316,52 @@ class ContentExtractor:
         parts.append(f"</{tag}>")
         return "".join(parts)
 
+    def _split_mixed_strike_html(self, element: Tag, task: str) -> str:
+        """HTML-нотация для цветного элемента с частично зачёркнутым текстом:
+        чередование <span class="critic-del"> и <span class="critic-ins"> одной
+        задачи (аналог _split_mixed_strike для HTML-островов таблиц, ТЗ п. 4.7).
+        Потомки рендерятся как содержимое сырой HTML-ячейки; смешанный потомок
+        режется рекурсивно (его тег-обёртка не воспроизводится)."""
+        runs: List[Tuple[str, str]] = []
+
+        def add(kind: str, piece: Optional[str]) -> None:
+            if not piece:
+                return
+            if runs and runs[-1][0] == kind:
+                runs[-1] = (kind, runs[-1][1] + piece)
+            else:
+                runs.append((kind, piece))
+
+        self._critic_stack.append(task)
+        try:
+            for child in element.children:
+                if isinstance(child, NavigableString):
+                    if isinstance(child, Comment):
+                        continue
+                    add("ins", _escape_stray_tag_openers(str(child).replace(" ", " ")))
+                elif isinstance(child, Tag):
+                    if self._is_ignored_element(child):
+                        continue
+                    wrapper = BeautifulSoup("<td></td>", "html.parser").td
+                    wrapper.append(child.__copy__())
+                    if self._is_fully_struck(child):
+                        add("del", self._process_nested_table_cell_content(wrapper))
+                    elif self._is_strikethrough(child):
+                        add("mixed", self._split_mixed_strike_html(child, task))
+                    else:
+                        add("ins", self._process_nested_table_cell_content(wrapper))
+        finally:
+            self._critic_stack.pop()
+
+        out = []
+        for kind, piece in runs:
+            if kind == "mixed" or not piece.strip():
+                out.append(piece)
+            else:
+                cls = "critic-ins" if kind == "ins" else "critic-del"
+                out.append(f'<span class="{cls}" data-task="{task}">{piece}</span>')
+        return "".join(out)
+
     def _process_nested_table_cell_content(self, cell: Tag) -> str:
         """
         ИСПРАВЛЕНО: Обработка содержимого ячейки вложенной таблицы.
@@ -2354,6 +2400,12 @@ class ContentExtractor:
                     marker = self._critic_marker_for(child)
                     if marker is not None:
                         task, kind = marker
+                        # Смешанное зачёркивание (2026-10-01): зачёркнута лишь
+                        # часть текста — чередование critic-del/critic-ins одной
+                        # задачи, как _split_mixed_strike для текстовых маркеров.
+                        if kind == "del" and not self._is_fully_struck(child):
+                            result_parts.append(self._split_mixed_strike_html(child, task))
+                            continue
                         self._critic_stack.append(task)
                         try:
                             inner = self._process_nested_table_cell_content(child)
