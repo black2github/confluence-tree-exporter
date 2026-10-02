@@ -33,7 +33,16 @@
 # состояние на дату исходной выгрузки. Новая выгрузка должна быть сделана той же
 # версией экспортёра и с теми же ключами, что исходная.
 #
+# Два сценария, одна команда:
+#   • ИЗВЛЕЧЕНИЕ — каталога назначения нет или в нём нет страниц: страницы из
+#     списка складываются туда в той же структуре подкаталогов, с картинками.
+#     Каталог создаётся. Ссылки не сверяются: соседних страниц там заведомо нет.
+#     Так готовят набор страниц для передачи (например, в другой контур).
+#   • ЗАМЕНА — каталог назначения содержит выгрузку: страницы заменяются на своих
+#     местах, со всеми проверками ниже.
+#
 # Использование:
+#     python -m app.scripts.pick_pages <выгрузка> <новый каталог> --pages ids.txt
 #     python -m app.scripts.pick_pages <новая выгрузка> <архив> --pages ids.txt --dry-run
 #     python -m app.scripts.pick_pages <новая выгрузка> <архив> --pages ids.txt
 #     python -m app.scripts.pick_pages <новая выгрузка> <архив> --pages ids.txt --out pick.md
@@ -89,6 +98,8 @@ def index_tree(root: Path) -> Dict[str, dict]:
     """page_id → {rel: относительный путь (posix), title}. Дубль идентификатора
     в одном дереве — ошибка: неясно, какую из страниц считать настоящей."""
     index: Dict[str, dict] = {}
+    if not root.is_dir():
+        return index
     for path in sorted(root.rglob("*.md")):
         if path.name.startswith(_SERVICE_PREFIX):
             continue
@@ -221,7 +232,12 @@ def build_plan(new_root: Path, archive_root: Path, ids: List[str]) -> dict:
             f"  архив:          {arc_idx[sample]['rel']}\n"
             "Укажите каталоги одного уровня дерева.")
 
-    plan = {"pages": [], "errors": [], "warnings": [], "assets": []}
+    # Извлечение: каталога назначения нет либо в нём нет страниц. Тогда это не
+    # замена в архиве, а выборка страниц в отдельный каталог: сверять ссылки не
+    # с чем (соседних страниц там заведомо нет), предупреждения были бы шумом.
+    extract = not arc_idx
+    plan = {"pages": [], "errors": [], "warnings": [], "assets": [],
+            "extract": extract}
     planned_rels = set()
     removed_rels = set()
     for pid in ids:
@@ -265,7 +281,7 @@ def build_plan(new_root: Path, archive_root: Path, ids: List[str]) -> dict:
         if page["old_rel"] == page["rel"]:
             old_md, old_other = referenced_files(_read(archive_root / page["rel"]))
             known = set(old_md) | set(old_other)
-        md_targets = [t for t in md_targets if t not in known]
+        md_targets = [] if extract else [t for t in md_targets if t not in known]
         for target in other_targets:
             res = _resolve(page["rel"], target)
             if res is not None and (new_root / res).is_file():
@@ -274,6 +290,9 @@ def build_plan(new_root: Path, archive_root: Path, ids: List[str]) -> dict:
             # В новой выгрузке файла нет. Если он уже лежит в архиве — остаётся
             # как был; если ссылка была и раньше — не новость.
             if (res is not None and (archive_root / res).is_file()) or target in known:
+                continue
+            if extract and (res is None or not (new_root / res).exists()):
+                # в исходной выгрузке файла тоже нет — извлечение этого не меняет
                 continue
             plan["warnings"].append(
                 f"{page['id']} «{page['title']}»: файл по ссылке не найден ни в "
@@ -369,8 +388,11 @@ def main(argv=None) -> int:
         prog="pick_pages",
         description="Перенос выбранных страниц из новой полной выгрузки в архив "
                     "по тем же относительным путям. Всё или ничего.")
-    parser.add_argument("new_root", help="каталог новой полной выгрузки")
-    parser.add_argument("archive_root", help="каталог архива (того же уровня дерева)")
+    parser.add_argument("new_root", help="каталог выгрузки, из которого берутся страницы")
+    parser.add_argument("archive_root",
+                        help="каталог назначения: существующий архив того же уровня "
+                             "дерева (замена страниц) либо новый или пустой каталог "
+                             "(извлечение страниц с сохранением структуры)")
     parser.add_argument("--pages", required=True, metavar="FILE",
                         help="файл со списком идентификаторов страниц")
     parser.add_argument("--dry-run", action="store_true",
@@ -379,10 +401,12 @@ def main(argv=None) -> int:
     args = parser.parse_args(argv)
 
     new_root, archive_root = Path(args.new_root), Path(args.archive_root)
-    for label, root in (("новая выгрузка", new_root), ("архив", archive_root)):
-        if not root.is_dir():
-            print(f"ОШИБКА: каталог не найден ({label}): {root}", file=sys.stderr)
-            return 2
+    if not new_root.is_dir():
+        print(f"ОШИБКА: каталог выгрузки не найден: {new_root}", file=sys.stderr)
+        return 2
+    if archive_root.exists() and not archive_root.is_dir():
+        print(f"ОШИБКА: каталог назначения — не каталог: {archive_root}", file=sys.stderr)
+        return 2
     if new_root.resolve() == archive_root.resolve():
         print("ОШИБКА: новая выгрузка и архив — один и тот же каталог.", file=sys.stderr)
         return 2
@@ -415,6 +439,8 @@ def main(argv=None) -> int:
         print(f"  ⚠ {w}")
     mode = ("ОШИБКИ — ничего не записано" if plan["errors"]
             else "пробный прогон" if args.dry_run else "выполнено")
+    if plan["extract"]:
+        mode += " (извлечение в отдельный каталог)"
     print(f"[pick] {mode}; в списке: {len(ids)}; "
           + "; ".join(f"{s}: {counts[s]}" for s in (REPLACED, ADDED, MOVED, SAME))
           + f"; картинок: {len(plan['assets'])}; ошибок: {len(plan['errors'])}; "
