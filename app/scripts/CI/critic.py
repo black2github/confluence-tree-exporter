@@ -68,13 +68,19 @@ _SUB_RE = re.compile(r"\{~~\s*(" + TASK_ID_PATTERN + r")\s*:\s*(.*?)~>(.*?)~~\}"
 # Идентификатор задачи сразу за опенером — чтобы назвать вложенные маркеры.
 _ID_AFTER_OPENER_RE = re.compile(r"\{[+~-]{2}\s*(" + TASK_ID_PATTERN + r")\s*:")
 
-# Открывающая/закрывающая fenced-fence в начале строки (``` или ~~~, 3+ символа).
-# Правило CommonMark: у backtick-ограждения инфо-строка не может содержать обратную
-# кавычку. Без этого ограничения строки вида ```` ```"filter"``: {` ```` — а это не
-# ограждение, а склеенный inline-код — принимались за открывающие, и код-зона
-# накрывала требования (инцидент 2026-09-06: в одном файле шесть таких «ограждений»,
-# из-за них reject не доходил до маркеров с первого раза). Для ~~~ ограничения нет.
-_FENCE_RE = re.compile(r"^[ \t]*(?:`{3,}[^`\n]*|~{3,}[^\n]*)\r?\n?$")
+# Границы fenced-блоков — общее правило прибора самопроверки и разметки
+# (app/scripts/CI/kitcheck/fence.py, решение владельца 2026-10-17): ограждение —
+# строка целиком, ``` или ~~~ (3+); у backtick-ограждения инфо-строка без «`»
+# (CommonMark) — строки вида ```` ```"filter"``: {` ```` (склеенный inline-код)
+# не ограждения: прежде они открывали мнимую код-зону, накрывавшую требования
+# (инцидент 2026-09-06). Вложенность — по виду и длине: ``` внутри ```` —
+# содержимое блока; закрывающее ограждение с инфо-строкой закрывает блок (и даёт
+# предупреждение W4), чтобы хвост файла не уходил из-под маркеров.
+try:
+    from .kitcheck import fence as _fence
+except ImportError:  # запуск файлом: python app/scripts/CI/critic.py …
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    from kitcheck import fence as _fence  # type: ignore
 
 
 class CriticError(Exception):
@@ -103,42 +109,19 @@ def _split_fenced_regions(text: str) -> List[Tuple[str, str, int]]:
     Возвращает список (kind, region_text, start_line), где kind ∈ {"code", "text"}.
     Внутри fenced code blocks (``` … ``` / ~~~ … ~~~) разметка не разбирается и не
     применяется (ТЗ п. 5.3). start_line — 1-based номер первой строки зоны в исходном
-    тексте (для сообщений об ошибках).
+    тексте (для сообщений об ошибках). Границы блоков — kitcheck/fence.py; незакрытый
+    блок — код до конца текста (lint показывает его ошибкой E10).
     """
     lines = text.splitlines(keepends=True)
     regions: List[Tuple[str, str, int]] = []
-    buf: List[str] = []
-    buf_start = 1
-    in_fence = False
-    line_no = 0
-
-    def flush(kind: str):
-        if buf:
-            regions.append((kind, "".join(buf), buf_start))
-        buf.clear()
-
-    for line in lines:
-        line_no += 1
-        is_fence = bool(_FENCE_RE.match(line))
-        if not in_fence and is_fence:
-            # начинается fenced-блок: закрываем текстовую зону, открываем кодовую
-            flush("text")
-            buf_start = line_no
-            buf.append(line)
-            in_fence = True
-        elif in_fence and is_fence:
-            # закрывается fenced-блок
-            buf.append(line)
-            flush("code")
-            buf_start = line_no + 1
-            in_fence = False
-        else:
-            if not buf:
-                buf_start = line_no
-            buf.append(line)
-
-    # Хвост. Незакрытый fenced-блок отдаём как код — его содержимое и так не обрабатывается.
-    flush("code" if in_fence else "text")
+    pos = 0
+    for b in _fence.blocks(lines):
+        if b.start > pos:
+            regions.append(("text", "".join(lines[pos:b.start]), pos + 1))
+        regions.append(("code", "".join(lines[b.start:b.end + 1]), b.start + 1))
+        pos = b.end + 1
+    if pos < len(lines):
+        regions.append(("text", "".join(lines[pos:]), pos + 1))
     return regions
 
 
@@ -820,7 +803,7 @@ class Finding:
         self.path = path
         self.line = line
         self.level = level      # "error" | "warning"
-        self.rule = rule        # короткий код правила (E1..E7, W1..W2)
+        self.rule = rule        # короткий код правила (E1..E10, W1, W4)
         self.message = message
 
     def _loc(self) -> str:
@@ -921,6 +904,10 @@ def lint_text(text: str, path: Optional[Path] = None) -> List[Finding]:
                     "CriticMarkup внутри сырого HTML — здесь применяется HTML-нотация (п. 4.7)")
             if kind_at(start) == "code":
                 add(line, "error", "E5", "маркер внутри fenced code block")
+            elif any(start < s < m.end() for s, _e, k in spans if k == "code"):
+                # E5: маркер открыт в тексте и закрыт внутри блока кода (или за ним):
+                # разбор по зонам видит половину маркера, reject оставит её в тексте.
+                add(line, "error", "E5", "маркер пересекает границу fenced code block")
             elif "\n" in m.group(0):
                 # E5: многострочный маркер, разрывающий синтаксическую конструкцию.
                 if _is_table_row(line_of_start(start) + "\n"):
@@ -935,6 +922,27 @@ def lint_text(text: str, path: Optional[Path] = None) -> List[Finding]:
     for m in re.finditer(r'data-task="(UNKNOWN-[0-9a-fA-F]+)"', text):
         add(_line_at(text, m.start(1)), "error", "E3",
             f"плейсхолдер {m.group(1)} не разобран аналитиком (HTML-нотация)")
+
+    # Блоки кода, не закрытые по правилам GitLab (kitcheck/fence.py, решение владельца
+    # 2026-10-17). W4: закрывающее ограждение с инфо-строкой — разметка блок закрывает и
+    # маркеры ниже обрабатывает, но в рендере GitLab дальше всё код. E10: блок не закрыт
+    # до конца файла — маркеры в хвосте apply/reject не обработают (неутверждённое молча
+    # останется в «чистом ПРОМ»); выгрузка таких блоков не порождает — это правка руками.
+    lines_ke = text.splitlines(keepends=True)
+    offsets = [0]
+    for ln_ in lines_ke:
+        offsets.append(offsets[-1] + len(ln_))
+    for fi in _fence.issues(lines_ke):
+        at = _line_at(text, offsets[fi.line - 1])
+        if fi.kind == "close-with-info":
+            add(at, "warning", "W4",
+                f"блок кода закрыт ограждением с инфо-строкой (строка "
+                f"{_line_at(text, offsets[fi.close_line - 1])}): в GitLab это не закрытие — "
+                "дальше всё код; закрыть голым ``` того же вида и длины")
+        else:
+            add(at, "error", "E10",
+                "блок кода не закрыт до конца файла: маркеры в хвосте apply/reject не "
+                "обработают; закрыть ограждением того же вида и длины")
 
     # E4: незакрытый маркер — опенер, не входящий ни в один опознанный маркер и не в коде.
     for m in _ANY_OPENER_RE.finditer(text):
