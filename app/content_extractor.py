@@ -1011,8 +1011,28 @@ class ContentExtractor:
         if not self._element_effectively_colored(element, norm):
             return None
         task = self.config.color_map.get(norm) or ("UNKNOWN-" + norm.lstrip("#"))
-        kind = "del" if self._is_strikethrough(element) else "ins"
+        # Удаление — если зачёркнут сам элемент, его потомок ИЛИ ПРЕДОК. Обратный
+        # шаблон источника <s><span color>текст</span></s> (зачёркивание снаружи
+        # цвета) до 2026-10-23 давал вставку {++…++}: внешний <s> цвета не имеет,
+        # маркер на нём не ставился, а на цветном спане зачёркивания «не видно».
+        # Табличный путь (_cell_uniform_critic) поднимался по предкам и был прав,
+        # отсюда страницы, где абзац — вставка, а таблица под ним — удаление
+        # ([КК_ВК] ЭФ Клиента, TEAMTB-3633: 392 таких места на одной странице).
+        kind = ("del" if self._is_strikethrough(element) or self._struck_by_ancestor(element)
+                else "ins")
         return task, kind
+
+    @staticmethod
+    def _struck_by_ancestor(element: Tag) -> bool:
+        """Зачёркнут ли элемент каким-либо предком (<s>/<del>/<strike> или
+        line-through в стиле)."""
+        cur = element.parent
+        while cur is not None and isinstance(cur, Tag):
+            if (cur.name in ("s", "del", "strike")
+                    or "line-through" in (cur.get("style") or "").lower()):
+                return True
+            cur = cur.parent
+        return False
 
     def _wrap_critic(self, task: str, kind: str, inner: Optional[str]) -> str:
         """Оборачивает отрендеренный фрагмент в маркер CriticMarkup (ТЗ п. 4.4).
