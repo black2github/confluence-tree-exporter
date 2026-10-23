@@ -76,7 +76,12 @@ _SERVICE_PREFIX = "migration-"
 REPLACED, ADDED, MOVED, SAME = "заменена", "добавлена", "перемещена", "без изменений"
 MARKUP_ONLY, TEXT_CHANGED, FLAG_ONLY = ("только разметка маркеров", "изменён текст",
                                         "только страничный флаг")
-KINDS = (TEXT_CHANGED, MARKUP_ONLY, FLAG_ONLY)
+# 1.9.12: текст только дописан — старый текст без маркеров целиком сохранился в новом.
+# Так выглядит восстановление строк таблиц и пунктов списков экспортёром 1.9.11 (они
+# терялись раньше); но так же выглядит и правка в Confluence, которая только дописала
+# текст, — признак механический, различить их может только история страницы.
+TEXT_ADDED = "дополнен текст"
+KINDS = (TEXT_CHANGED, TEXT_ADDED, MARKUP_ONLY, FLAG_ONLY)
 
 # Снятие разметки CriticMarkup для классификации замены (2026-10-23): текст между
 # маркерами сравнивается без самих маркеров во всех трёх нотациях — текстовой,
@@ -105,14 +110,47 @@ def strip_markup(text: str) -> str:
     return _WS_RE.sub(" ", t)
 
 
+_TOKEN_RE = re.compile(r"<[^>]*>|[^\s<]+")
+
+
+def _is_subsequence(old: List[str], new: List[str]) -> bool:
+    """Входит ли old в new как подпоследовательность (жадно, O(n+m))."""
+    it = iter(new)
+    return all(any(tok == cand for cand in it) for tok in old)
+
+
+def only_additions(old_plain: str, new_plain: str) -> bool:
+    """Новый текст = старый плюс вставки: ничего не удалено и не переписано.
+
+    Строки сравниваются difflib: удалённая строка — сразу «нет». Заменённый блок
+    строк допустим, только если его токены (теги и слова) входят в новый блок как
+    подпоследовательность — так ловится строка таблицы, восстановленная внутри
+    однострочного HTML-острова. Проверка локальна по блокам, поэтому слово, правленное
+    в одном месте, не «найдётся» случайно где-то дальше по странице."""
+    from difflib import SequenceMatcher
+    a, b = old_plain.split("\n"), new_plain.split("\n")
+    for op, i1, i2, j1, j2 in SequenceMatcher(None, a, b, autojunk=False).get_opcodes():
+        if op == "delete":
+            return False
+        if op == "replace":
+            old_toks = _TOKEN_RE.findall("\n".join(a[i1:i2]))
+            new_toks = _TOKEN_RE.findall("\n".join(b[j1:j2]))
+            if not _is_subsequence(old_toks, new_toks):
+                return False
+    return True
+
+
 def classify_change(old_text: str, new_text: str) -> str:
     """Чем отличается новая версия заменяемой страницы от старой."""
     old_nf = _FLAG_LINE_RE.sub("", old_text.replace("\r\n", "\n"))
     new_nf = _FLAG_LINE_RE.sub("", new_text.replace("\r\n", "\n"))
     if old_nf == new_nf:
         return FLAG_ONLY
-    if strip_markup(old_text) == strip_markup(new_text):
+    old_plain, new_plain = strip_markup(old_text), strip_markup(new_text)
+    if old_plain == new_plain:
         return MARKUP_ONLY
+    if only_additions(old_plain, new_plain):
+        return TEXT_ADDED
     return TEXT_CHANGED
 
 
@@ -420,6 +458,13 @@ def render_report(plan: dict, new_root: Path, archive_root: Path, dry_run: bool,
     for k, hint in ((TEXT_CHANGED, "Изменился текст страницы: правка в Confluence после "
                                    "прошлой выгрузки (возможно, вместе с исправлениями "
                                    "экспортёра). Переносится как событие «выгрузка»."),
+                    (TEXT_ADDED, "Старый текст сохранился целиком, добавились строки, "
+                                 "пункты или абзацы. Первая выгрузка 1.9.11 поверх "
+                                 "старой: это восстановление текста, который экспортёр "
+                                 "раньше терял (строки таблиц, вложенные списки), — не "
+                                 "правка аналитика. Признак механический: правка в "
+                                 "Confluence, которая только дописала текст, выглядит "
+                                 "так же; при сомнении — история страницы."),
                     (MARKUP_ONLY, "Текст тот же, изменились только маркеры (вид, "
                                   "наличие, нотация): результат исправлений экспортёра."),
                     (FLAG_ONLY, "Изменилась только строка unapproved_jira во frontmatter: "
