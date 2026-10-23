@@ -293,6 +293,20 @@ def _resolve_page_content(page_data: Dict, include_unapproved: bool, critic: boo
                 "задач %s; apply/reject их не увидят",
                 name, blk["line"], blk["chars"], blk["markers"], ", ".join(blk["tasks"]))
 
+        # Сторож «ПРОМ не потерян» (--check-prom, 2026-10-23): слова reject-all против
+        # чёрного текста источника, вставки против apply. Ловит класс «фрагмент ушёл не
+        # в тот маркер» независимо от пути разметки (1.9.7–1.9.9 жили незамеченными три
+        # месяца). Страницу с форс-обёрткой не проверяем: там чёрное обёрнуто намеренно.
+        if _config.CHECK_PROM and not forced:
+            from app.prom_invariant import check_prom_invariant
+            prom_chk = check_prom_invariant(raw, content, extractor,
+                                            [d["text"] for d in dropped])
+            if not prom_chk.ok:
+                logger.warning("  ⚠ '%s': инвариант ПРОМ нарушен — %s", name, prom_chk.summary())
+                if critic_acc is not None:
+                    critic_acc.setdefault("prom_invariant", []).append(
+                        {"page": name, **prom_chk.as_report()})
+
         if critic_acc is not None:
             from app.scripts.migrate_colors import accumulate_page
             accumulate_page(critic_acc, name, result, survey_body_colors(raw, result))
@@ -803,7 +817,7 @@ def main():
     # --drop-strikethrough можно указать в любом месте аргументов; они переопределяют
     # соответствующие значения из конфигурации.
     flags = {"--http", "--all", "--tasks", "--keep-history", "--with-images",
-             "--with-attachments", "--with-index", "--drop-strikethrough"}
+             "--with-attachments", "--with-index", "--drop-strikethrough", "--check-prom"}
 
     # Ключ со значением: --unapproved-jira <file.json> — список Jira ID неутверждённых
     # задач (эмуляция похода в RAG). Извлекается ДО построения позиционных args.
@@ -858,6 +872,17 @@ def main():
         print("Example (исключить зачёркнутый текст при любом раскладе, в т.ч. с --all): "
               "python migrate_confluence_tree.py 12345 CORP_CARDS лимиты --all --drop-strikethrough")
         sys.exit(1)
+
+    # Сторож «ПРОМ не потерян»: только в критик-режиме — сравнивать reject-all не с чем,
+    # если маркеров нет. Без флага конфигурация не трогается (по умолчанию False).
+    check_prom = "--check-prom" in sys.argv
+    if check_prom:
+        import app.config as _cfg_prom
+        if critic:
+            _cfg_prom.CHECK_PROM = True
+            logger.info("Сторож ПРОМ (--check-prom): включён — расхождения в лог и в отчёт цвета")
+        else:
+            logger.warning("Флаг --check-prom действует только вместе с --tasks — проигнорирован")
 
     # Список неутверждённых задач (эмуляция похода в RAG): JSON — либо список строк,
     # либо {"unapproved_jira": [...]}. Ключа нет — конвейер работает как раньше.
@@ -998,6 +1023,9 @@ def main():
         logger.info("  Задач в манифесте: %d; ручной разбор: %d позиций (уплощений: %d)",
                     len(manifest["tasks"]), rst["positions_manual_review"],
                     rst["nested_flattened"])
+        if check_prom and critic:
+            logger.info("  Сторож ПРОМ: страниц с нарушением инварианта: %d",
+                        len(report.get("prom_invariant", [])))
 
     logger.info("")
     logger.info("Migration complete:")

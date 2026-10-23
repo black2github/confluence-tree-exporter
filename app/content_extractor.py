@@ -88,6 +88,34 @@ def _escape_stray_tag_openers(text: str) -> str:
     return _TAG_OPENER_RE.sub("&lt;", text)
 
 
+# Теги, которые экспортёр сам эмитит в HTML-островах (сырые таблицы и их содержимое).
+# Всё остальное, похожее на тег, в острове — это текст источника, потерявший
+# экранирование: плейсхолдер <accountNum>, образец XML <GUID> и т.п.
+_ISLAND_TAGS = (
+    "table", "thead", "tbody", "tfoot", "tr", "td", "th", "p", "span", "a", "ul", "ol",
+    "li", "strong", "em", "b", "i", "u", "s", "del", "ins", "strike", "br", "code",
+    "pre", "h1", "h2", "h3", "h4", "h5", "h6", "img", "div", "sup", "sub", "hr",
+    "blockquote", "font", "time",
+)
+_UNKNOWN_ISLAND_TAG_RE = re.compile(
+    r"(</?(?:" + "|".join(_ISLAND_TAGS) + r")(?=[\s/>])[^<>]*>)|<(?=[A-Za-z/!])")
+
+
+def _escape_unknown_island_tags(html: str) -> str:
+    """Пост-проход по готовому HTML острова: экранирует '<', открывающий тег,
+    которого экспортёр не эмитит (2026-10-23).
+
+    _escape_stray_tag_openers работает на ОДНОМ текстовом узле, а в Confluence
+    плейсхолдер часто разрезан: «&lt;» лежит в одном узле, «accountNum&gt;» — в
+    соседнем цветном спане. По узлам ни один из них не похож на тег, а в склеенном
+    выводе получается живой <accountNum>: рендер его прячет, критик при reject
+    дописывает мусорные закрывающие теги. Собственные теги экспортёра (первая
+    альтернатива регулярки) проходят как есть; '<' перед кириллицей/цифрой/пробелом
+    не трогаем (<Номер заявки> остаётся байт-в-байт). Идемпотентно: у '&lt;' нет '<'.
+    """
+    return _UNKNOWN_ISLAND_TAG_RE.sub(lambda m: m.group(1) or "&lt;", html)
+
+
 _MARGIN_LEFT_RE = re.compile(r'margin-left\s*:\s*([^;]+)')
 
 
@@ -300,7 +328,7 @@ class ContentExtractor:
             html_parts.append("</tbody>")
 
         html_parts.append("</table>")
-        return "\n".join(html_parts)
+        return _escape_unknown_island_tags("\n".join(html_parts))
 
     def _html_row_parts(self, row: Tag) -> List[str]:
         """Рендерит строку HTML-таблицы. В режиме CriticMarkup цельно-цветная строка
@@ -860,7 +888,7 @@ class ContentExtractor:
                 # и целиком помечал его удалением: {--еях--} — apply терял «ях»
                 # (страница «Запрос openApi»). Режем по зачёркнутости.
                 if kind == "del" and not self._is_fully_struck(element):
-                    return self._split_mixed_strike(element, task, context)
+                    return self._split_mixed_strike(element, task, context, outer_norm)
                 # Частичное перекрытие чёрным (2026-10-23): чёрные прогоны — ПРОМ,
                 # в маркер не попадают; см. _split_partial_override.
                 if self._has_partial_black_override(element, outer_norm):
@@ -873,13 +901,20 @@ class ContentExtractor:
                 return self._wrap_critic(task, kind, inner)
         return self._dispatch_element(element, context)
 
-    def _split_mixed_strike(self, element: Tag, task: str, context: str) -> str:
+    def _split_mixed_strike(self, element: Tag, task: str, context: str,
+                            own_norm: Optional[str] = None) -> str:
         """Цветной элемент с частично зачёркнутым текстом → чередование маркеров
         {--…--} (зачёркнутые потомки) и {++…++} (остальные) одной задачи.
 
         Потомок, в котором зачёркнутое и незачёркнутое снова перемешаны, режется
         рекурсивно (его собственный тег-обёртка при этом не воспроизводится).
         Вложенная разметка маркерами подавляется стеком, как при целой обёртке.
+
+        Незачёркнутый потомок, перекрытый чёрным (own_norm — цвет элемента), — ПРОМ,
+        в маркер не попадает (2026-10-23: <span color><s>И</s> <span black>ПРОМ</span>
+        новое</span> уходил во вставку целиком — проверка смешанного зачёркивания
+        стоит раньше проверки частичного перекрытия). Смешанный — режется как при
+        частичном перекрытии.
         """
         runs: List[Tuple[str, str]] = []   # (kind, отрендеренный кусок)
 
@@ -904,15 +939,23 @@ class ContentExtractor:
                     if self._is_fully_struck(child):
                         add("del", self._process_element(child, context))
                     elif self._is_strikethrough(child):
-                        add("mixed", self._split_mixed_strike(child, task, context))
+                        add("mixed", self._split_mixed_strike(child, task, context, own_norm))
                     else:
-                        add("ins", self._process_element(child, context))
+                        cls = self._child_color_class(child, own_norm) if own_norm else "colored"
+                        if cls == "black":
+                            add("plain", self._process_element(child, context))
+                        elif cls == "mixed":
+                            add("mixed", self._split_partial_override(
+                                child, task, "ins", own_norm, context))
+                        else:
+                            add("ins", self._process_element(child, context))
         finally:
             self._critic_stack.pop()
 
         out = []
         for kind, piece in runs:
-            out.append(piece if kind == "mixed" else self._wrap_critic(task, kind, piece))
+            out.append(piece if kind in ("mixed", "plain")
+                       else self._wrap_critic(task, kind, piece))
         return "".join(out)
 
     def _element_effectively_colored(self, element: Tag, own_norm: Optional[str]) -> bool:
@@ -2278,7 +2321,7 @@ class ContentExtractor:
             html_parts.append("".join(row_parts))
 
         html_parts.append("</table>")
-        return "".join(html_parts)
+        return _escape_unknown_island_tags("".join(html_parts))
 
     def _list_to_html(self, element: Tag) -> str:
         """
@@ -2311,12 +2354,12 @@ class ContentExtractor:
                     and not self._critic_suppress):
                 li_marker = self._critic_marker_for(li)
                 if li_marker is not None:
+                    li_norm = normalize_color(self._element_own_color(li) or "")
                     if li_marker[1] == "del" and not self._is_fully_struck(li):
                         # цветной пункт с частично зачёркнутым текстом — чередование
                         # critic-del/critic-ins, как для ячейки (1.9.3)
-                        parts.append(f"<li>{self._split_mixed_strike_html(li, li_marker[0])}</li>")
+                        parts.append(f"<li>{self._split_mixed_strike_html(li, li_marker[0], li_norm)}</li>")
                         continue
-                    li_norm = normalize_color(self._element_own_color(li) or "")
                     if self._has_partial_black_override(li, li_norm):
                         parts.append(f"<li>{self._split_partial_override_html(li, li_marker[0], li_marker[1], li_norm)}</li>")
                         continue
@@ -2329,10 +2372,10 @@ class ContentExtractor:
                     marker = self._critic_marker_for(child)
                     if marker is not None:
                         task, kind = marker
-                        if kind == "del" and not self._is_fully_struck(child):
-                            li_parts.append(self._split_mixed_strike_html(child, task))
-                            continue
                         norm = normalize_color(self._element_own_color(child) or "")
+                        if kind == "del" and not self._is_fully_struck(child):
+                            li_parts.append(self._split_mixed_strike_html(child, task, norm))
+                            continue
                         if self._has_partial_black_override(child, norm):
                             li_parts.append(
                                 self._split_partial_override_html(child, task, kind, norm))
@@ -2398,12 +2441,15 @@ class ContentExtractor:
         parts.append(f"</{tag}>")
         return "".join(parts)
 
-    def _split_mixed_strike_html(self, element: Tag, task: str) -> str:
+    def _split_mixed_strike_html(self, element: Tag, task: str,
+                                 own_norm: Optional[str] = None) -> str:
         """HTML-нотация для цветного элемента с частично зачёркнутым текстом:
         чередование <span class="critic-del"> и <span class="critic-ins"> одной
         задачи (аналог _split_mixed_strike для HTML-островов таблиц, ТЗ п. 4.7).
         Потомки рендерятся как содержимое сырой HTML-ячейки; смешанный потомок
-        режется рекурсивно (его тег-обёртка не воспроизводится)."""
+        режется рекурсивно (его тег-обёртка не воспроизводится). Незачёркнутый
+        потомок, перекрытый чёрным (own_norm — цвет элемента), — ПРОМ без маркера
+        (2026-10-23, см. _split_mixed_strike)."""
         runs: List[Tuple[str, str]] = []
 
         def add(kind: str, piece: Optional[str]) -> None:
@@ -2429,15 +2475,22 @@ class ContentExtractor:
                     if self._is_fully_struck(child):
                         add("del", self._process_nested_table_cell_content(wrapper))
                     elif self._is_strikethrough(child):
-                        add("mixed", self._split_mixed_strike_html(child, task))
+                        add("mixed", self._split_mixed_strike_html(child, task, own_norm))
                     else:
-                        add("ins", self._process_nested_table_cell_content(wrapper))
+                        cls = self._child_color_class(child, own_norm) if own_norm else "colored"
+                        if cls == "black":
+                            add("plain", self._process_nested_table_cell_content(wrapper))
+                        elif cls == "mixed":
+                            add("mixed", self._split_partial_override_html(
+                                child, task, "ins", own_norm))
+                        else:
+                            add("ins", self._process_nested_table_cell_content(wrapper))
         finally:
             self._critic_stack.pop()
 
         out = []
         for kind, piece in runs:
-            if kind == "mixed" or not piece.strip():
+            if kind in ("mixed", "plain") or not piece.strip():
                 out.append(piece)
             else:
                 cls = "critic-ins" if kind == "ins" else "critic-del"
@@ -2626,10 +2679,10 @@ class ContentExtractor:
                         # Смешанное зачёркивание (2026-10-01): зачёркнута лишь
                         # часть текста — чередование critic-del/critic-ins одной
                         # задачи, как _split_mixed_strike для текстовых маркеров.
-                        if kind == "del" and not self._is_fully_struck(child):
-                            result_parts.append(self._split_mixed_strike_html(child, task))
-                            continue
                         norm = normalize_color(self._element_own_color(child) or "")
+                        if kind == "del" and not self._is_fully_struck(child):
+                            result_parts.append(self._split_mixed_strike_html(child, task, norm))
+                            continue
                         if self._has_partial_black_override(child, norm):
                             result_parts.append(
                                 self._split_partial_override_html(child, task, kind, norm))

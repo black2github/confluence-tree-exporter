@@ -43,6 +43,7 @@ def new_accumulator() -> dict:
         "unnamed_status": [],         # гейт выхода: служебный столбец без имени status
         "auto_page_flag": [],         # сторож заморозки: страница целиком за одной задачей
         "forced_skipped": [],         # задача из списка не первая в истории: форса нет
+        "prom_invariant": [],         # сторож --check-prom: reject-all разошёлся с ПРОМ источника
         "unresolved_placeholders": [],
         "nested": [],                 # уплощённые вложенности (ТЗ 4.5) — заполняет вызывающий
         "tasks": {},                  # task_id -> {color, confidence, pages:set, markers}
@@ -145,7 +146,8 @@ def finalize(acc: dict, service: str, migrated_at: str) -> Tuple[dict, dict]:
                  + len(acc["multi_task_rows"]) + len(acc["literal_nesting"])
                  + len(acc["markers_in_code"]) + len(acc["unnamed_status"])
                  + sum(1 for f in acc["auto_page_flag"] if f["kind"] != "поставлен")
-                 + len(acc.get("forced_skipped", [])))
+                 + len(acc.get("forced_skipped", []))
+                 + len(acc.get("prom_invariant", [])))
     report = {
         "migrated_at": migrated_at,
         "service": service,
@@ -165,6 +167,7 @@ def finalize(acc: dict, service: str, migrated_at: str) -> Tuple[dict, dict]:
         "unnamed_status": acc["unnamed_status"],
         "auto_page_flag": acc["auto_page_flag"],
         "forced_skipped": acc.get("forced_skipped", []),
+        "prom_invariant": acc.get("prom_invariant", []),
         "nested_flattened": acc["nested"],
         "color_summary": sorted(acc["color_summary"],
                                 key=lambda c: (c["color"], -c["count"], c["page"])),
@@ -380,6 +383,29 @@ def render_report_md(report: dict) -> str:
              "заморожена — её чёрные правки останутся в ПРОМ, нужен разбор",
              [f"- «{f['page']}»: {f['kind']} ({', '.join(f['tasks'])})"
               for f in report.get("forced_skipped", [])])
+
+    # Сторож --check-prom: слова ПРОМ источника против reject-all / вставки против apply.
+    # Непустая секция = разметка страницы отправила текст не в тот маркер — разбор руками
+    # (уплощения ТЗ п. 4.5 тоже сюда попадают: они оборачивают чёрный текст намеренно).
+    def _words(items):
+        return ", ".join(f"{w}×{n}" if n > 1 else w for w, n in items[:20])
+
+    def _prom_line(p):
+        bits = []
+        if p.get("lost_reject"):
+            bits.append(f"потеряно из ПРОМ {sum(n for _, n in p['lost_reject'])} слов "
+                        f"({_words(p['lost_reject'])})")
+        if p.get("leaked_reject"):
+            bits.append(f"лишнее в ПРОМ {sum(n for _, n in p['leaked_reject'])} слов "
+                        f"({_words(p['leaked_reject'])})")
+        if p.get("lost_apply"):
+            bits.append(f"потеряно при apply {sum(n for _, n in p['lost_apply'])} слов "
+                        f"({_words(p['lost_apply'])})")
+        return f"- «{p['page']}»: " + "; ".join(bits)
+
+    _section("Инвариант ПРОМ нарушен (--check-prom): текст reject-all разошёлся с чёрным "
+             "текстом источника или apply потерял вставку — нужен разбор",
+             [_prom_line(p) for p in report.get("prom_invariant", [])])
 
     nested = report.get("nested_flattened", [])
     _by_conf = lambda c: [f"- задачи {n['tasks']} на «{n['page']}»"
