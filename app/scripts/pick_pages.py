@@ -65,6 +65,7 @@ import sys
 from pathlib import Path, PurePosixPath
 from typing import Dict, List, Optional, Tuple
 
+from app.scripts.CI.critic import TASK_ID_PATTERN
 from app.scripts.repair_export import split_frontmatter
 
 _PAGE_ID_RE = re.compile(r"^confluence_page_id:\s*['\"]?(\d+)['\"]?\s*$", re.M)
@@ -73,6 +74,46 @@ _IMG_SRC_RE = re.compile(r"<img\b[^>]*?\bsrc\s*=\s*([\"'])(.*?)\1", re.I | re.S)
 _SERVICE_PREFIX = "migration-"
 
 REPLACED, ADDED, MOVED, SAME = "заменена", "добавлена", "перемещена", "без изменений"
+MARKUP_ONLY, TEXT_CHANGED, FLAG_ONLY = ("только разметка маркеров", "изменён текст",
+                                        "только страничный флаг")
+KINDS = (TEXT_CHANGED, MARKUP_ONLY, FLAG_ONLY)
+
+# Снятие разметки CriticMarkup для классификации замены (2026-10-23): текст между
+# маркерами сравнивается без самих маркеров во всех трёх нотациях — текстовой,
+# столбца status и HTML-острова. Так отличается починка экспортёра (изменился
+# только вид или наличие маркеров) от правки страницы в Confluence (изменился
+# текст). Все <span> снимаются целиком: экспортёр порождает их только для
+# нотации critic-*.
+_INLINE_OPEN_RE = re.compile(r"\{(?:\+\+|--)\s*" + TASK_ID_PATTERN + r"\s*:\s?")
+_INLINE_CLOSE_RE = re.compile(r"(?:\+\+|--)\}")
+_SPAN_RE = re.compile(r"</?span\b[^>]*>")
+_ROW_RE = re.compile(r'\s+class="critic-row-(?:ins|del)"\s+data-task="[^"]*"')
+_STATUS_CELL_RE = re.compile(r"(\|\s*)[+-]" + TASK_ID_PATTERN + r"(\s*)(?=\|)")
+_FLAG_LINE_RE = re.compile(r"^unapproved_jira:[^\n]*\n?", re.M)
+_WS_RE = re.compile(r"[ \t]+")
+
+
+def strip_markup(text: str) -> str:
+    """Текст без маркеров трёх нотаций и без страничного флага; пробелы схлопнуты."""
+    t = text.replace("\r\n", "\n")
+    t = _FLAG_LINE_RE.sub("", t)
+    t = _INLINE_OPEN_RE.sub("", t)
+    t = _INLINE_CLOSE_RE.sub("", t)
+    t = _SPAN_RE.sub("", t)
+    t = _ROW_RE.sub("", t)
+    t = _STATUS_CELL_RE.sub(r"\1\2", t)
+    return _WS_RE.sub(" ", t)
+
+
+def classify_change(old_text: str, new_text: str) -> str:
+    """Чем отличается новая версия заменяемой страницы от старой."""
+    old_nf = _FLAG_LINE_RE.sub("", old_text.replace("\r\n", "\n"))
+    new_nf = _FLAG_LINE_RE.sub("", new_text.replace("\r\n", "\n"))
+    if old_nf == new_nf:
+        return FLAG_ONLY
+    if strip_markup(old_text) == strip_markup(new_text):
+        return MARKUP_ONLY
+    return TEXT_CHANGED
 
 
 class PickError(Exception):
@@ -266,8 +307,12 @@ def build_plan(new_root: Path, archive_root: Path, ids: List[str]) -> dict:
             status = SAME
         else:
             status = REPLACED
+        kind = ""
+        if status == REPLACED:
+            kind = classify_change(_read(dst), _read(src))
         plan["pages"].append({"id": pid, "title": new["title"], "rel": rel,
-                              "old_rel": old["rel"] if old else None, "status": status})
+                              "old_rel": old["rel"] if old else None, "status": status,
+                              "kind": kind})
         planned_rels.add(rel)
 
     # Сопутствующие файлы и проверка ссылок — по состоянию архива ПОСЛЕ переноса.
@@ -358,6 +403,8 @@ def render_report(plan: dict, new_root: Path, archive_root: Path, dry_run: bool,
              f"Состояние: **{state}**.", "",
              "| Итог | Страниц |", "|---|---|"]
     lines += [f"| {s} | {counts[s]} |" for s in (REPLACED, ADDED, MOVED, SAME)]
+    kinds = {k: sum(1 for p in plan["pages"] if p.get("kind") == k) for k in KINDS}
+    lines += [f"| {REPLACED}: {k} | {kinds[k]} |" for k in KINDS]
     lines += [f"| сопутствующих файлов (картинки) | {len(plan['assets'])} |",
               f"| ошибок | {len(plan['errors'])} |",
               f"| предупреждений | {len(plan['warnings'])} |", ""]
@@ -370,10 +417,27 @@ def render_report(plan: dict, new_root: Path, archive_root: Path, dry_run: bool,
 
     _section("Ошибки — перенос остановлен", [f"- {e}" for e in plan["errors"]])
     _section("Предупреждения — проверить руками", [f"- {w}" for w in plan["warnings"]])
+    for k, hint in ((TEXT_CHANGED, "Изменился текст страницы: правка в Confluence после "
+                                   "прошлой выгрузки (возможно, вместе с исправлениями "
+                                   "экспортёра). Переносится как событие «выгрузка»."),
+                    (MARKUP_ONLY, "Текст тот же, изменились только маркеры (вид, "
+                                  "наличие, нотация): результат исправлений экспортёра."),
+                    (FLAG_ONLY, "Изменилась только строка unapproved_jira во frontmatter: "
+                                "правило страничной заморозки.")):
+        lines.append(f"## Заменена — {k} ({kinds[k]})")
+        lines.append("")
+        if kinds[k]:
+            lines.extend([hint, ""])
+            lines.extend(f"- {p['id']} «{p['title']}»" for p in plan["pages"]
+                         if p.get("kind") == k)
+        else:
+            lines.append("_нет_")
+        lines.append("")
     rows = []
     for p in plan["pages"]:
         tail = f" (было: `{p['old_rel']}`)" if p["status"] == MOVED else ""
-        rows.append(f"- {p['status']}: {p['id']} «{p['title']}» — `{p['rel']}`{tail}")
+        kind = f" [{p['kind']}]" if p.get("kind") else ""
+        rows.append(f"- {p['status']}{kind}: {p['id']} «{p['title']}» — `{p['rel']}`{tail}")
     _section("Страницы", rows)
     _section("Сопутствующие файлы",
              [f"- {a['status']}: `{a['rel']}`" for a in plan["assets"]])
@@ -445,6 +509,9 @@ def main(argv=None) -> int:
           + "; ".join(f"{s}: {counts[s]}" for s in (REPLACED, ADDED, MOVED, SAME))
           + f"; картинок: {len(plan['assets'])}; ошибок: {len(plan['errors'])}; "
           f"предупреждений: {len(plan['warnings'])}")
+    kinds = {k: sum(1 for p in plan["pages"] if p.get("kind") == k) for k in KINDS}
+    if any(kinds.values()):
+        print("[pick] заменена, по причине: " + "; ".join(f"{k}: {kinds[k]}" for k in KINDS))
     return 1 if plan["errors"] else 0
 
 

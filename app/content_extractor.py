@@ -2289,8 +2289,46 @@ class ContentExtractor:
                         parts.append(f"<li>{black}</li>")
                 continue
 
+            # \u0420\u0435\u0436\u0438\u043c CriticMarkup \u0432\u043d\u0443\u0442\u0440\u0438 \u0441\u043f\u0438\u0441\u043a\u0430 HTML-\u043e\u0441\u0442\u0440\u043e\u0432\u0430 (2026-10-23). \u0414\u043e \u043f\u0440\u0430\u0432\u043a\u0438
+            # \u043f\u0443\u043d\u043a\u0442\u044b \u0441\u043f\u0438\u0441\u043a\u043e\u0432 \u0432 \u044f\u0447\u0435\u0439\u043a\u0430\u0445 \u0432\u043b\u043e\u0436\u0435\u043d\u043d\u044b\u0445 \u0442\u0430\u0431\u043b\u0438\u0446 \u0440\u0435\u043d\u0434\u0435\u0440\u0438\u043b\u0438\u0441\u044c \u0411\u0415\u0417 \u043c\u0430\u0440\u043a\u0435\u0440\u043e\u0432:
+            # \u0446\u0432\u0435\u0442\u043d\u043e\u0439 <span> \u0432\u043d\u0443\u0442\u0440\u0438 <li> \u0443\u0445\u043e\u0434\u0438\u043b \u0432 \u043e\u0431\u0449\u0443\u044e \u0432\u0435\u0442\u043a\u0443 \u043a\u0430\u043a \u043e\u0431\u044b\u0447\u043d\u044b\u0439 \u0442\u0435\u043a\u0441\u0442,
+            # \u0442\u043e\u0433\u0434\u0430 \u043a\u0430\u043a \u0441\u043e\u0441\u0435\u0434\u043d\u0438\u0435 <p> \u0442\u043e\u0439 \u0436\u0435 \u044f\u0447\u0435\u0439\u043a\u0438 \u043c\u0430\u0440\u043a\u0435\u0440\u044b \u043f\u043e\u043b\u0443\u0447\u0430\u043b\u0438. \u0421\u0442\u0440\u0430\u043d\u0438\u0446\u0430
+            # [\u041a\u041a_\u0412\u041a] \u042d\u0424 \u041a\u043b\u0438\u0435\u043d\u0442\u0430 \u0432 \u0440\u0435\u0436\u0438\u043c\u0435 \u043f\u0440\u043e\u0441\u043c\u043e\u0442\u0440\u0430 (TEAMTB-4518): \u043f\u043b\u0430\u0448\u043a\u0430 \u0441\u0442\u0430\u0442\u0443\u0441\u0430 \u2014
+            # \u0430\u0431\u0437\u0430\u0446 \u0440\u0430\u0437\u043c\u0435\u0447\u0435\u043d, \u043e\u0431\u0430 \u043f\u0443\u043d\u043a\u0442\u0430 \u0443\u0441\u043b\u043e\u0432\u0438\u0439 \u0438 \u0441\u043f\u0438\u0441\u043e\u043a \u0444\u0438\u043b\u044c\u0442\u0440\u043e\u0432 \u0433\u043e\u043b\u044b\u0435; \u043f\u043e\u0441\u043b\u0435
+            # reject-all \u0442\u0435\u043a\u0441\u0442 \u0437\u0430\u0434\u0430\u0447\u0438 \u043e\u0441\u0442\u0430\u043b\u0441\u044f \u0432 \u041f\u0420\u041e\u041c. \u041f\u0443\u043d\u043a\u0442, \u0446\u0432\u0435\u0442\u043d\u043e\u0439 \u0446\u0435\u043b\u0438\u043a\u043e\u043c
+            # (<li style="color">), \u043e\u0431\u043e\u0440\u0430\u0447\u0438\u0432\u0430\u0435\u0442\u0441\u044f \u0432\u0435\u0441\u044c; \u0446\u0432\u0435\u0442\u043d\u044b\u0435 \u043f\u043e\u0442\u043e\u043c\u043a\u0438 \u2014 \u043a\u0430\u0436\u0434\u044b\u0439.
+            li_marker = None
+            if (self.config.critic_mode and not self._critic_stack
+                    and not self._critic_suppress):
+                li_marker = self._critic_marker_for(li)
+                if li_marker is not None:
+                    if li_marker[1] == "del" and not self._is_fully_struck(li):
+                        # цветной пункт с частично зачёркнутым текстом — чередование
+                        # critic-del/critic-ins, как для ячейки (1.9.3)
+                        parts.append(f"<li>{self._split_mixed_strike_html(li, li_marker[0])}</li>")
+                        continue
+                    self._critic_stack.append(li_marker[0])
             li_parts = []
             for child in li.children:
+                if (self.config.critic_mode and not self._critic_stack
+                        and not self._critic_suppress and isinstance(child, Tag)
+                        and not self._is_ignored_element(child)):
+                    marker = self._critic_marker_for(child)
+                    if marker is not None:
+                        task, kind = marker
+                        if kind == "del" and not self._is_fully_struck(child):
+                            li_parts.append(self._split_mixed_strike_html(child, task))
+                            continue
+                        self._critic_stack.append(task)
+                        try:
+                            inner = self._process_nested_table_cell_content(child)
+                        finally:
+                            self._critic_stack.pop()
+                        if inner.strip():
+                            cls = "critic-ins" if kind == "ins" else "critic-del"
+                            li_parts.append(
+                                f'<span class="{cls}" data-task="{task}">{inner}</span>')
+                        continue
                 if isinstance(child, NavigableString):
                     text = str(child).replace("\u00a0", " ")
                     if text.strip():
@@ -2331,7 +2369,13 @@ class ContentExtractor:
                         content = self._process_nested_table_cell_content(child)
                         if content:
                             li_parts.append(content)
-            parts.append(f"<li>{''.join(li_parts)}</li>")
+            body = "".join(li_parts)
+            if li_marker is not None:
+                self._critic_stack.pop()
+                if body.strip():
+                    cls = "critic-ins" if li_marker[1] == "ins" else "critic-del"
+                    body = f'<span class="{cls}" data-task="{li_marker[0]}">{body}</span>'
+            parts.append(f"<li>{body}</li>")
 
         parts.append(f"</{tag}>")
         return "".join(parts)
