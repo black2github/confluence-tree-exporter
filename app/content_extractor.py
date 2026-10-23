@@ -861,6 +861,10 @@ class ContentExtractor:
                 # (страница «Запрос openApi»). Режем по зачёркнутости.
                 if kind == "del" and not self._is_fully_struck(element):
                     return self._split_mixed_strike(element, task, context)
+                # Частичное перекрытие чёрным (2026-10-23): чёрные прогоны — ПРОМ,
+                # в маркер не попадают; см. _split_partial_override.
+                if self._has_partial_black_override(element, outer_norm):
+                    return self._split_partial_override(element, task, kind, outer_norm, context)
                 self._critic_stack.append(task)
                 try:
                     inner = self._dispatch_element(element, context)
@@ -1072,8 +1076,13 @@ class ContentExtractor:
             if not part or re.fullmatch(r"\n[ \t]*\n", part) or not part.strip():
                 out.append(part)
                 continue
-            sep = "" if part[:1] == " " else " "
-            out.append(f"{open_tok}{task}:{sep}{part}{close_tok}")
+            # Ведущие пробелы фрагмента — ПЕРЕД маркером, не внутри: критик при apply
+            # снимает всё, что стоит между «ID:» и текстом (\s*), и пробел на стыке
+            # «середина{++ID: после++}» пропадал бы → «серединапосле» (2026-10-23,
+            # разрезание по цвету). Снаружи он переживает и apply, и reject.
+            lead_ws = part[: len(part) - len(part.lstrip(" "))]
+            body = part[len(lead_ws):]
+            out.append(f"{lead_ws}{open_tok}{task}: {body}{close_tok}")
         out.append(trail)
         return "".join(out)
 
@@ -2307,6 +2316,10 @@ class ContentExtractor:
                         # critic-del/critic-ins, как для ячейки (1.9.3)
                         parts.append(f"<li>{self._split_mixed_strike_html(li, li_marker[0])}</li>")
                         continue
+                    li_norm = normalize_color(self._element_own_color(li) or "")
+                    if self._has_partial_black_override(li, li_norm):
+                        parts.append(f"<li>{self._split_partial_override_html(li, li_marker[0], li_marker[1], li_norm)}</li>")
+                        continue
                     self._critic_stack.append(li_marker[0])
             li_parts = []
             for child in li.children:
@@ -2318,6 +2331,11 @@ class ContentExtractor:
                         task, kind = marker
                         if kind == "del" and not self._is_fully_struck(child):
                             li_parts.append(self._split_mixed_strike_html(child, task))
+                            continue
+                        norm = normalize_color(self._element_own_color(child) or "")
+                        if self._has_partial_black_override(child, norm):
+                            li_parts.append(
+                                self._split_partial_override_html(child, task, kind, norm))
                             continue
                         self._critic_stack.append(task)
                         try:
@@ -2426,6 +2444,147 @@ class ContentExtractor:
                 out.append(f'<span class="{cls}" data-task="{task}">{piece}</span>')
         return "".join(out)
 
+    # ------------------------------------------------------------------------------
+    # Частичное перекрытие цвета чёрным (2026-10-23). Аналитик красит абзац целиком, а
+    # потом возвращает часть фраз в чёрный: <span color><span black>ПРОМ-текст</span>:
+    # <a>ссылка</a></span>. Правило «внутренний цвет перекрывает внешний» (инцидент
+    # 2026-08-06) снимало маркер, только когда перекрыт ВЕСЬ текст; при частичном
+    # перекрытии элемент оборачивался целиком вместе с чёрным текстом, и reject-all
+    # удалял его из ПРОМ («Лимиты на снятие наличных», страница 2166860490; на четырёх
+    # страницах ЭФ — 76 таких спанов). Режем по эффективному цвету: чёрные прогоны —
+    # как есть, цветные — в маркер. Тот же приём, что для смешанного зачёркивания.
+    # ------------------------------------------------------------------------------
+
+    def _child_color_class(self, child, own_norm: str) -> str:
+        """'black' — весь текст потомка перекрыт не-правочным цветом (ПРОМ),
+        'colored' — ни один прогон не перекрыт (цвет элемента виден), 'mixed' — и то
+        и другое. Перекрытие другой ЦВЕТНОЙ задачей сюда не доходит: его раньше
+        уплощает _has_nested_diff_color (ТЗ п. 4.5)."""
+        if isinstance(child, NavigableString):
+            return "colored"
+        black = colored = False
+        for text_node in child.find_all(string=True):
+            if isinstance(text_node, Comment) or not str(text_node).strip():
+                continue
+            eff = None
+            cur = text_node.parent
+            while cur is not None and isinstance(cur, Tag):
+                own = self._element_own_color(cur)
+                if own:
+                    eff = own
+                    break
+                if cur is child:
+                    break
+                cur = cur.parent
+            if eff is None or normalize_color(eff) == own_norm:
+                colored = True
+            elif not self._is_edit_color(eff):
+                black = True
+            else:
+                colored = True          # другая правка — не наш случай
+        if black and colored:
+            return "mixed"
+        return "black" if black else "colored"
+
+    def _has_partial_black_override(self, element: Tag, own_norm: Optional[str]) -> bool:
+        """Есть ли в цветном элементе и видимый собственный цвет, и чёрный текст."""
+        if not own_norm:
+            return False
+        black = colored = False
+        for child in element.children:
+            if isinstance(child, NavigableString):
+                if str(child).strip():
+                    colored = True
+                continue
+            if not isinstance(child, Tag) or self._is_ignored_element(child):
+                continue
+            cls = self._child_color_class(child, own_norm)
+            if cls == "mixed":
+                return True
+            black |= cls == "black"
+            colored |= cls == "colored"
+        return black and colored
+
+    def _split_partial_override(self, element: Tag, task: str, kind: str,
+                                own_norm: str, context: str) -> str:
+        """Текстовые маркеры: чёрные потомки — без маркера, остальное — в {++/--}."""
+        runs: List[Tuple[str, str]] = []
+
+        def add(k: str, piece: Optional[str]) -> None:
+            if not piece:
+                return
+            if runs and runs[-1][0] == k:
+                runs[-1] = (k, runs[-1][1] + piece)
+            else:
+                runs.append((k, piece))
+
+        self._critic_stack.append(task)
+        try:
+            for child in element.children:
+                if isinstance(child, NavigableString):
+                    if not isinstance(child, Comment):
+                        add("mark", self._process_text_node(str(child), context))
+                    continue
+                if not isinstance(child, Tag) or self._is_ignored_element(child):
+                    continue
+                cls = self._child_color_class(child, own_norm)
+                if cls == "black":
+                    add("plain", self._dispatch_element(child, context))
+                elif cls == "mixed":
+                    add("mixed", self._split_partial_override(child, task, kind, own_norm, context))
+                else:
+                    add("mark", self._process_element(child, context))
+        finally:
+            self._critic_stack.pop()
+        return "".join(self._wrap_critic(task, kind, piece) if k == "mark" else piece
+                       for k, piece in runs)
+
+    def _split_partial_override_html(self, element: Tag, task: str, kind: str,
+                                     own_norm: str) -> str:
+        """HTML-нотация для островов: чёрные потомки — как есть, остальное — в
+        <span class="critic-ins|critic-del">."""
+        runs: List[Tuple[str, str]] = []
+
+        def add(k: str, piece: Optional[str]) -> None:
+            if not piece:
+                return
+            if runs and runs[-1][0] == k:
+                runs[-1] = (k, runs[-1][1] + piece)
+            else:
+                runs.append((k, piece))
+
+        def render(child: Tag) -> str:
+            wrapper = BeautifulSoup("<td></td>", "html.parser").td
+            wrapper.append(child.__copy__())
+            return self._process_nested_table_cell_content(wrapper)
+
+        self._critic_stack.append(task)
+        try:
+            for child in element.children:
+                if isinstance(child, NavigableString):
+                    if not isinstance(child, Comment):
+                        add("mark", _escape_stray_tag_openers(str(child).replace(" ", " ")))
+                    continue
+                if not isinstance(child, Tag) or self._is_ignored_element(child):
+                    continue
+                cls = self._child_color_class(child, own_norm)
+                if cls == "black":
+                    add("plain", render(child))
+                elif cls == "mixed":
+                    add("mixed", self._split_partial_override_html(child, task, kind, own_norm))
+                else:
+                    add("mark", render(child))
+        finally:
+            self._critic_stack.pop()
+        cls_name = "critic-ins" if kind == "ins" else "critic-del"
+        out = []
+        for k, piece in runs:
+            if k == "mark" and piece.strip():
+                out.append(f'<span class="{cls_name}" data-task="{task}">{piece}</span>')
+            else:
+                out.append(piece)
+        return "".join(out)
+
     def _process_nested_table_cell_content(self, cell: Tag) -> str:
         """
         ИСПРАВЛЕНО: Обработка содержимого ячейки вложенной таблицы.
@@ -2469,6 +2628,11 @@ class ContentExtractor:
                         # задачи, как _split_mixed_strike для текстовых маркеров.
                         if kind == "del" and not self._is_fully_struck(child):
                             result_parts.append(self._split_mixed_strike_html(child, task))
+                            continue
+                        norm = normalize_color(self._element_own_color(child) or "")
+                        if self._has_partial_black_override(child, norm):
+                            result_parts.append(
+                                self._split_partial_override_html(child, task, kind, norm))
                             continue
                         self._critic_stack.append(task)
                         try:
