@@ -298,6 +298,38 @@ class ContentExtractor:
             return ""
         return self._process_nested_table_cell_content(cell)
 
+    @staticmethod
+    def _table_row_sections(table: Tag) -> Tuple[List[Tag], List[Tag], List[Tag], bool]:
+        """Строки ЭТОЙ таблицы (не вложенных) по секциям: (шапка, тело, подвал, есть_tbody).
+
+        До 2026-10-23 все три пути (pipe, HTML верхнего уровня, вложенная HTML) брали
+        строки только из ПЕРВОГО <tbody> (find("tbody")) либо прямых <tr>: строки во
+        втором <tbody>, в <tfoot> или за обёрткой внутри таблицы молча выпадали. Сторож
+        --check-prom нашёл так таблицы «Логика работы метода» на трёх страницах B2B
+        (~1230 слов каждая): в выгрузке оставалась одна строка заголовка.
+
+        Строка принадлежит таблице, если ближайший предок-<table> — она сама; секция —
+        ближайший предок thead/tbody/tfoot до неё. Порядок — документный, подвал в конце
+        (так его рисует браузер). Вложенная шапка чужой таблицы сюда не попадает.
+        """
+        head: List[Tag] = []
+        body: List[Tag] = []
+        foot: List[Tag] = []
+        has_tbody = False
+        for tr in table.find_all("tr"):
+            if tr.find_parent("table") is not table:
+                continue
+            section = tr.find_parent(["thead", "tbody", "tfoot", "table"])
+            name = section.name if section is not None else "table"
+            if name == "thead":
+                head.append(tr)
+            elif name == "tfoot":
+                foot.append(tr)
+            else:
+                has_tbody |= name == "tbody"
+                body.append(tr)
+        return head, body, foot, has_tbody
+
     def _process_top_level_table_to_html(self, element: Tag) -> str:
         """
         Конвертирует таблицу верхнего уровня в HTML.
@@ -308,23 +340,22 @@ class ContentExtractor:
         который сохраняет структуру списков и вложенных таблиц.
         """
         html_parts = ["<table>"]
+        head, body, foot, has_tbody = self._table_row_sections(element)
 
         # Обрабатываем thead если есть
-        thead = element.find("thead")
-        if thead:
+        if head:
             html_parts.append("<thead>")
-            for row in thead.find_all("tr", recursive=False):
+            for row in head:
                 html_parts.extend(self._html_row_parts(row))
             html_parts.append("</thead>")
 
-        # Обрабатываем tbody если есть; если нет — берём tr прямо из таблицы
-        tbody = element.find("tbody")
-        rows_source = tbody if tbody else element
-        if tbody:
+        # Тело: все <tbody> таблицы и прямые <tr> подряд, подвал — в конце тела
+        # (обёртка <tbody> — как раньше, только если она была в источнике).
+        if has_tbody:
             html_parts.append("<tbody>")
-        for row in rows_source.find_all("tr", recursive=False):
+        for row in body + foot:
             html_parts.extend(self._html_row_parts(row))
-        if tbody:
+        if has_tbody:
             html_parts.append("</tbody>")
 
         html_parts.append("</table>")
@@ -395,25 +426,22 @@ class ContentExtractor:
         # Собираем строки: (тип, row_data, status). status непуст только для цельно-цветных
         # строк в режиме CriticMarkup (целая добавленная/удалённая строка, ТЗ п. 4.6).
         table_rows = []
+        head, body, foot, has_tbody = self._table_row_sections(element)
 
         # 1. Обрабатываем ВСЕ строки из thead как заголовки
         # независимо от того, используют они <th> или <td>
-        thead = element.find("thead")
-        if thead:
-            header_rows = thead.find_all("tr", recursive=False)
-            for row in header_rows:
-                cells = row.find_all(["td", "th"], recursive=False)
-                if cells:
-                    # КРИТИЧЕСКОЕ ИСПРАВЛЕНИЕ: Все строки из thead обрабатываем как заголовки
-                    row_data = self._process_table_row_cells(cells, context, is_header=True)
-                    if row_data:
-                        table_rows.append(("header", row_data, ""))
+        for row in head:
+            cells = row.find_all(["td", "th"], recursive=False)
+            if cells:
+                # КРИТИЧЕСКОЕ ИСПРАВЛЕНИЕ: Все строки из thead обрабатываем как заголовки
+                row_data = self._process_table_row_cells(cells, context, is_header=True)
+                if row_data:
+                    table_rows.append(("header", row_data, ""))
 
-        # 2. ЗАТЕМ обрабатываем тело таблицы из tbody
-        tbody = element.find("tbody")
-        if tbody:
-            body_rows = tbody.find_all("tr", recursive=False)
-            for row in body_rows:
+        # 2. ЗАТЕМ тело: все <tbody> и подвал (до 2026-10-23 — только первый <tbody>,
+        # см. _table_row_sections). Таблица из одних прямых <tr> — шаг 3, как раньше.
+        if has_tbody or head or foot:
+            for row in body + foot:
                 cells = row.find_all(["td", "th"], recursive=False)
                 if cells:
                     row_data, status = self._critic_markdown_row(row, cells, context)
@@ -422,7 +450,7 @@ class ContentExtractor:
 
         # 3. Если нет явных thead/tbody, берем все tr напрямую
         if not table_rows:
-            direct_rows = element.find_all("tr", recursive=False)
+            direct_rows = body
             for i, row in enumerate(direct_rows):
                 cells = row.find_all(["td", "th"], recursive=False)
                 if cells:
@@ -902,7 +930,8 @@ class ContentExtractor:
         return self._dispatch_element(element, context)
 
     def _split_mixed_strike(self, element: Tag, task: str, context: str,
-                            own_norm: Optional[str] = None) -> str:
+                            own_norm: Optional[str] = None,
+                            inherited_black: bool = False) -> str:
         """Цветной элемент с частично зачёркнутым текстом → чередование маркеров
         {--…--} (зачёркнутые потомки) и {++…++} (остальные) одной задачи.
 
@@ -915,7 +944,14 @@ class ContentExtractor:
         новое</span> уходил во вставку целиком — проверка смешанного зачёркивания
         стоит раньше проверки частичного перекрытия). Смешанный — режется как при
         частичном перекрытии.
+
+        inherited_black (1.9.11) — элемент лежит в чёрном предке (рекурсия): его прямой
+        текст и бесцветные потомки — ПРОМ, а не вставка. Пример со страницы 2166860176:
+        <li цвет> с зачёркнутым номером внутри, а в нём чёрный <p>Выполняются проверки…</p>
+        — текст абзаца уходил во вставку задачи.
         """
+        text_black = (self._text_is_black(element, own_norm, inherited_black)
+                      if own_norm else False)
         runs: List[Tuple[str, str]] = []   # (kind, отрендеренный кусок)
 
         def add(kind: str, piece: Optional[str]) -> None:
@@ -932,21 +968,24 @@ class ContentExtractor:
                 if isinstance(child, NavigableString):
                     if isinstance(child, Comment):
                         continue
-                    add("ins", self._process_text_node(str(child), context))
+                    add("plain" if text_black else "ins",
+                        self._process_text_node(str(child), context))
                 elif isinstance(child, Tag):
                     if self._is_ignored_element(child):
                         continue
                     if self._is_fully_struck(child):
                         add("del", self._process_element(child, context))
                     elif self._is_strikethrough(child):
-                        add("mixed", self._split_mixed_strike(child, task, context, own_norm))
+                        add("mixed", self._split_mixed_strike(child, task, context, own_norm,
+                                                              text_black))
                     else:
-                        cls = self._child_color_class(child, own_norm) if own_norm else "colored"
+                        cls = (self._child_color_class(child, own_norm, text_black)
+                               if own_norm else "colored")
                         if cls == "black":
                             add("plain", self._process_element(child, context))
                         elif cls == "mixed":
                             add("mixed", self._split_partial_override(
-                                child, task, "ins", own_norm, context))
+                                child, task, "ins", own_norm, context, text_black))
                         else:
                             add("ins", self._process_element(child, context))
         finally:
@@ -1763,7 +1802,19 @@ class ContentExtractor:
 
         item_counter = 1
 
-        for li in element.find_all("li", recursive=False):
+        for li in element.find_all(["li", "ul", "ol"], recursive=False):
+            # Список прямо внутри списка, без обёртки <li> (<ul><ul><li>…), — так его
+            # сохраняет редактор Confluence при отступе первого пункта. До 1.9.11 брались
+            # только <li>, и такой список пропадал целиком вместе с текстом (страница
+            # 2166860358, нашёл сторож --check-prom). Вложенным он становится под
+            # предыдущим пунктом; если пунктов ещё не было — на том же уровне (строка
+            # с отступом без родителя markdown прочёл бы как блок кода).
+            if li.name in ("ul", "ol"):
+                level = indent_level + 1 if list_items else indent_level
+                nested_content = self._process_list(li, context, level)
+                if nested_content:
+                    list_items.append(nested_content)
+                continue
             if not self._should_include_element(li):
                 if not self.config.include_colored:
                     black_content = self._extract_black_elements_from_colored_container(li, context)
@@ -2283,14 +2334,10 @@ class ContentExtractor:
         """
         ИСПРАВЛЕНО: Преобразование вложенной таблицы в HTML с обработкой глубокой вложенности
         """
-        rows = table.find_all("tr", recursive=False)
-        if not rows:
-            tbody = table.find("tbody")
-            thead = table.find("thead")
-            if tbody:
-                rows.extend(tbody.find_all("tr", recursive=False))
-            if thead:
-                rows.extend(thead.find_all("tr", recursive=False))
+        # Все строки таблицы: шапка, все <tbody>, подвал (2026-10-23). Раньше — прямые <tr>
+        # либо ПЕРВЫЙ <tbody>, а шапка дописывалась ПОСЛЕ тела (заголовок в конце таблицы).
+        head, body, foot, _has_tbody = self._table_row_sections(table)
+        rows = head + body + foot
 
         if not rows:
             return ""
@@ -2333,7 +2380,14 @@ class ContentExtractor:
         tag = element.name  # ul или ol
         parts = [f"<{tag}>"]
 
-        for li in element.find_all("li", recursive=False):
+        for li in element.find_all(["li", "ul", "ol"], recursive=False):
+            # Список прямо внутри списка без <li> (1.9.11, см. _process_list): вкладывается
+            # как есть — браузер рисует <ul><ul> вложенным, текст не теряется.
+            if li.name in ("ul", "ol"):
+                nested_html = self._list_to_html(li)
+                if nested_html != f"<{li.name}></{li.name}>":
+                    parts.append(nested_html)
+                continue
             if not self._should_include_element(li):
                 if not self.config.include_colored:
                     black = self._extract_black_elements_from_colored_container(li, "nested_table_cell")
@@ -2442,14 +2496,17 @@ class ContentExtractor:
         return "".join(parts)
 
     def _split_mixed_strike_html(self, element: Tag, task: str,
-                                 own_norm: Optional[str] = None) -> str:
+                                 own_norm: Optional[str] = None,
+                                 inherited_black: bool = False) -> str:
         """HTML-нотация для цветного элемента с частично зачёркнутым текстом:
         чередование <span class="critic-del"> и <span class="critic-ins"> одной
         задачи (аналог _split_mixed_strike для HTML-островов таблиц, ТЗ п. 4.7).
         Потомки рендерятся как содержимое сырой HTML-ячейки; смешанный потомок
         режется рекурсивно (его тег-обёртка не воспроизводится). Незачёркнутый
         потомок, перекрытый чёрным (own_norm — цвет элемента), — ПРОМ без маркера
-        (2026-10-23, см. _split_mixed_strike)."""
+        (2026-10-23, см. _split_mixed_strike; наследование чёрного — 1.9.11)."""
+        text_black = (self._text_is_black(element, own_norm, inherited_black)
+                      if own_norm else False)
         runs: List[Tuple[str, str]] = []
 
         def add(kind: str, piece: Optional[str]) -> None:
@@ -2466,7 +2523,7 @@ class ContentExtractor:
                 if isinstance(child, NavigableString):
                     if isinstance(child, Comment):
                         continue
-                    add("ins", _escape_stray_tag_openers(str(child).replace(" ", " ")))
+                    add("plain" if text_black else "ins", _escape_stray_tag_openers(str(child).replace(" ", " ")))
                 elif isinstance(child, Tag):
                     if self._is_ignored_element(child):
                         continue
@@ -2475,14 +2532,16 @@ class ContentExtractor:
                     if self._is_fully_struck(child):
                         add("del", self._process_nested_table_cell_content(wrapper))
                     elif self._is_strikethrough(child):
-                        add("mixed", self._split_mixed_strike_html(child, task, own_norm))
+                        add("mixed", self._split_mixed_strike_html(child, task, own_norm,
+                                                                   text_black))
                     else:
-                        cls = self._child_color_class(child, own_norm) if own_norm else "colored"
+                        cls = (self._child_color_class(child, own_norm, text_black)
+                               if own_norm else "colored")
                         if cls == "black":
                             add("plain", self._process_nested_table_cell_content(wrapper))
                         elif cls == "mixed":
                             add("mixed", self._split_partial_override_html(
-                                child, task, "ins", own_norm))
+                                child, task, "ins", own_norm, text_black))
                         else:
                             add("ins", self._process_nested_table_cell_content(wrapper))
         finally:
@@ -2508,13 +2567,17 @@ class ContentExtractor:
     # как есть, цветные — в маркер. Тот же приём, что для смешанного зачёркивания.
     # ------------------------------------------------------------------------------
 
-    def _child_color_class(self, child, own_norm: str) -> str:
+    def _child_color_class(self, child, own_norm: str, inherited_black: bool = False) -> str:
         """'black' — весь текст потомка перекрыт не-правочным цветом (ПРОМ),
         'colored' — ни один прогон не перекрыт (цвет элемента виден), 'mixed' — и то
         и другое. Перекрытие другой ЦВЕТНОЙ задачей сюда не доходит: его раньше
-        уплощает _has_nested_diff_color (ТЗ п. 4.5)."""
+        уплощает _has_nested_diff_color (ТЗ п. 4.5).
+
+        inherited_black — потомок лежит внутри ЧЁРНОГО элемента (рекурсия в смешанного
+        потомка): текст без собственного цвета тогда чёрный, а не цвета элемента
+        (2026-10-23, см. _split_partial_override)."""
         if isinstance(child, NavigableString):
-            return "colored"
+            return "black" if inherited_black else "colored"
         black = colored = False
         for text_node in child.find_all(string=True):
             if isinstance(text_node, Comment) or not str(text_node).strip():
@@ -2529,7 +2592,12 @@ class ContentExtractor:
                 if cur is child:
                     break
                 cur = cur.parent
-            if eff is None or normalize_color(eff) == own_norm:
+            if eff is None:
+                if inherited_black:
+                    black = True
+                else:
+                    colored = True
+            elif normalize_color(eff) == own_norm:
                 colored = True
             elif not self._is_edit_color(eff):
                 black = True
@@ -2558,9 +2626,24 @@ class ContentExtractor:
             colored |= cls == "colored"
         return black and colored
 
+    def _text_is_black(self, element: Tag, own_norm: str, inherited_black: bool) -> bool:
+        """Чёрный ли собственный (прямой) текст элемента при разборе частичного
+        перекрытия: свой цвет решает, иначе — наследуется от родителя по рекурсии.
+
+        До 2026-10-23 прямой текст считался цветом ВНЕШНЕГО элемента всегда, и в
+        <span цвет><span чёрный><span цвет>Каждая </span>анкета…</span></span>
+        чёрное «анкета…» уходило во вставку (страница 2166860176, нашёл сторож)."""
+        own = self._element_own_color(element)
+        if own:
+            return normalize_color(own) != own_norm and not self._is_edit_color(own)
+        return inherited_black
+
     def _split_partial_override(self, element: Tag, task: str, kind: str,
-                                own_norm: str, context: str) -> str:
+                                own_norm: str, context: str,
+                                inherited_black: bool = False) -> str:
         """Текстовые маркеры: чёрные потомки — без маркера, остальное — в {++/--}."""
+        text_black = self._text_is_black(element, own_norm, inherited_black)
+        text_kind = "plain" if text_black else "mark"
         runs: List[Tuple[str, str]] = []
 
         def add(k: str, piece: Optional[str]) -> None:
@@ -2576,15 +2659,16 @@ class ContentExtractor:
             for child in element.children:
                 if isinstance(child, NavigableString):
                     if not isinstance(child, Comment):
-                        add("mark", self._process_text_node(str(child), context))
+                        add(text_kind, self._process_text_node(str(child), context))
                     continue
                 if not isinstance(child, Tag) or self._is_ignored_element(child):
                     continue
-                cls = self._child_color_class(child, own_norm)
+                cls = self._child_color_class(child, own_norm, text_black)
                 if cls == "black":
                     add("plain", self._dispatch_element(child, context))
                 elif cls == "mixed":
-                    add("mixed", self._split_partial_override(child, task, kind, own_norm, context))
+                    add("mixed", self._split_partial_override(child, task, kind, own_norm,
+                                                              context, text_black))
                 else:
                     add("mark", self._process_element(child, context))
         finally:
@@ -2593,9 +2677,11 @@ class ContentExtractor:
                        for k, piece in runs)
 
     def _split_partial_override_html(self, element: Tag, task: str, kind: str,
-                                     own_norm: str) -> str:
+                                     own_norm: str, inherited_black: bool = False) -> str:
         """HTML-нотация для островов: чёрные потомки — как есть, остальное — в
         <span class="critic-ins|critic-del">."""
+        text_black = self._text_is_black(element, own_norm, inherited_black)
+        text_kind = "plain" if text_black else "mark"
         runs: List[Tuple[str, str]] = []
 
         def add(k: str, piece: Optional[str]) -> None:
@@ -2616,15 +2702,16 @@ class ContentExtractor:
             for child in element.children:
                 if isinstance(child, NavigableString):
                     if not isinstance(child, Comment):
-                        add("mark", _escape_stray_tag_openers(str(child).replace(" ", " ")))
+                        add(text_kind, _escape_stray_tag_openers(str(child).replace(" ", " ")))
                     continue
                 if not isinstance(child, Tag) or self._is_ignored_element(child):
                     continue
-                cls = self._child_color_class(child, own_norm)
+                cls = self._child_color_class(child, own_norm, text_black)
                 if cls == "black":
                     add("plain", render(child))
                 elif cls == "mixed":
-                    add("mixed", self._split_partial_override_html(child, task, kind, own_norm))
+                    add("mixed", self._split_partial_override_html(child, task, kind, own_norm,
+                                                                   text_black))
                 else:
                     add("mark", render(child))
         finally:

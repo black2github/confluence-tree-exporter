@@ -43,6 +43,7 @@ from typing import Dict, Iterable, List, Optional, Tuple
 
 from bs4 import BeautifulSoup, Comment, NavigableString, Tag
 
+from app.content_extractor import _ISLAND_TAGS
 from app.history_cleaner import remove_history_sections
 
 _WORD_RE = re.compile(r"[0-9A-Za-zА-Яа-яЁё_]+")
@@ -54,15 +55,31 @@ _BLOCK_TAGS = frozenset({
     "h5", "h6", "br", "pre", "blockquote", "section", "hr", "thead", "tbody",
 })
 
-# Нормализация markdown к словам: маркеры критика, HTML-теги островов (только
-# настоящие: латинское имя тега; <Номер заявки> — текст), картинки, адреса ссылок,
-# служебный столбец status и его ячейки ±ID.
+# Нормализация markdown к словам: маркеры критика, теги, картинки, адреса ссылок,
+# служебный столбец status и его ячейки ±ID, нумерация списков.
+#
+# Теги (1.9.11): вырезаются ТОЛЬКО те, что экспортёр эмитит сам (_ISLAND_TAGS), и
+# одинаково с обеих сторон — в markdown и в тексте источника. В 1.9.10 вырезалось
+# всё «тегообразное», и текстовые токены <vpan>, <XS>, XML/HTML в блоках кода
+# пропадали только из markdown: 22 ложных сигнала на выгрузке КК. Литерал <br> в
+# тексте источника от служебного <br> экспортёра не отличить — поэтому он снимается
+# и в источнике, симметрично.
 _MD_MARK_OPEN_RE = re.compile(r"\{(?:\+\+|--)[^:{}]*:\s*")
 _MD_MARK_CLOSE_RE = re.compile(r"(?:\+\+|--)\}")
-_MD_TAG_RE = re.compile(r"</?[A-Za-z][A-Za-z0-9-]*(?:\s[^<>]*)?/?>")
+_MD_TAG_RE = re.compile(r"</?(?:" + "|".join(_ISLAND_TAGS) + r")(?=[\s/>])[^<>]*>", re.I)
+# Нумерацию «N. » экспортёр пишет сам (в HTML источника её рисует браузер) — 28 ложных
+# «лишнее в ПРОМ: 1, 2, 3» на выгрузке КК.
+_MD_OL_NUMBER_RE = re.compile(r"^([ \t>]*)\d+\.[ \t]+", re.M)
+_SRC_PARA_NUMBER_RE = re.compile(r"^\s*\d+\.[ \t ]+")
 _MD_IMAGE_RE = re.compile(r"!\[[^\]]*\]\([^)]*\)")
-_MD_LINK_TARGET_RE = re.compile(r"\]\([^)]*\)")
-_MD_STATUS_CELL_RE = re.compile(r"\|\s*(?:status|[+\-±][A-Za-z0-9_-]+)\s*(?=\|)")
+# Адрес ссылки — со скобками внутри (…-(Copy)?node-id=…, #id-…(2FAOperationStrategy)-x):
+# markdown допускает в адресе сбалансированные скобки; [^)]* обрывался на первой «)»,
+# и хвост адреса считался словами (1.9.11).
+_MD_LINK_TARGET_RE = re.compile(r"\]\((?:[^()]|\([^()]*\))*\)")
+# Служебная ячейка ±ID: знак + идентификатор задачи (PROJECT-123, UNKNOWN-ff00ff). Число
+# «-3» в ячейке — текст, не служебная ячейка (1.9.11).
+_MD_STATUS_CELL_RE = re.compile(
+    r"\|\s*(?:status|[+\-±][A-Za-z][A-Za-z0-9_]*-[A-Za-z0-9]+)\s*(?=\|)")
 
 
 def words(text: str) -> Counter:
@@ -70,15 +87,24 @@ def words(text: str) -> Counter:
     return Counter(w.lower() for w in _WORD_RE.findall(text))
 
 
+def strip_exporter_tags(text: str) -> str:
+    """Вырезает теги, которые эмитит экспортёр; прочее «тегообразное» — текст."""
+    return _MD_TAG_RE.sub(" ", text)
+
+
 def md_plain(md: str) -> str:
     """Markdown критик-выгрузки → текст без разметки (для подсчёта слов)."""
-    s = _MD_MARK_OPEN_RE.sub("", md)
+    # нумерация экспортёра; абзац «N. …» снимается симметрично в source_word_sets
+    s = _MD_OL_NUMBER_RE.sub(r"\1", md)
+    s = _MD_MARK_OPEN_RE.sub("", s)
     s = _MD_MARK_CLOSE_RE.sub("", s)
     s = _MD_IMAGE_RE.sub(" ", s)
     s = _MD_LINK_TARGET_RE.sub("]", s)
     s = _MD_STATUS_CELL_RE.sub("|", s)
-    s = _MD_TAG_RE.sub(" ", s)
-    s = _html.unescape(s)
+    # подпись, которую экспортёр ставит перед вложенной таблицей в pipe-ячейке
+    s = s.replace("**Таблица:**", " ")
+    # сначала сущности (&lt;br> острова = литерал <br> источника), затем теги экспортёра
+    s = strip_exporter_tags(_html.unescape(s))
     return s.replace(" ", " ")
 
 
@@ -121,10 +147,17 @@ def source_word_sets(raw_html: str, extractor) -> Tuple[Counter, Counter]:
         if runs:
             runs[-1] = (runs[-1][0], runs[-1][1] + " ")
 
+    # Абзац прозы, начинающийся с «N. », в срезах reject/apply становится строкой
+    # «N. …», и md_plain снимает это как нумерацию — снимаем и здесь, симметрично, при
+    # любом цвете абзаца. В ячейках таблиц (pipe и острова) строка с цифры не
+    # начинается — там номер остаётся словом.
+    block_start = True
+
     for node in soup.descendants:
         if isinstance(node, Tag):
             if node.name in _BLOCK_TAGS:
                 separator()
+                block_start = True
             continue
         if isinstance(node, Comment) or not isinstance(node, NavigableString):
             continue
@@ -136,6 +169,10 @@ def source_word_sets(raw_html: str, extractor) -> Tuple[Counter, Counter]:
             separator()          # пробельный узел между инлайнами — разделитель
             continue
         state = _effective_state(node, extractor)
+        if block_start:
+            block_start = False
+            if node.find_parent(["td", "th"]) is None:
+                text = _SRC_PARA_NUMBER_RE.sub("", text, count=1)
         if runs and runs[-1][0] == state:
             runs[-1] = (state, runs[-1][1] + text)
         else:
@@ -144,7 +181,7 @@ def source_word_sets(raw_html: str, extractor) -> Tuple[Counter, Counter]:
     prom: Counter = Counter()
     applied: Counter = Counter()
     for state, text in runs:
-        w = words(text)
+        w = words(strip_exporter_tags(text))
         if state == "black":
             prom += w
             applied += w
