@@ -375,11 +375,16 @@ def _split_row_parts(line: str) -> Tuple[List[str], str]:
 
 
 def _find_status_part_index(header_line: str, status_column: str) -> Optional[int]:
-    """Индекс сегмента столбца `status` в разбиении header по '|' (или None, если столбца нет)."""
+    """Индекс сегмента столбца `status` в разбиении header по '|' (или None, если столбца нет).
+
+    Берётся ПОСЛЕДНИЙ столбец с таким именем (1.9.13): экспортёр дописывает служебный
+    столбец в конец, а в источнике бывает свой столбец «status» (примеры фильтров по
+    статусу). Раньше брался первый — столбец источника; его значения не похожи на ±ID,
+    и apply/reject пропускали таблицу целиком, вставки строк оставались в ПРОМ."""
     parts, _ = _split_row_parts(header_line)
     target = status_column.lower()
-    for idx, part in enumerate(parts):
-        if _norm(part) == target:
+    for idx in range(len(parts) - 1, -1, -1):
+        if _norm(parts[idx]) == target:
             return idx
     return None
 

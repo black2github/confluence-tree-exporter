@@ -1786,6 +1786,37 @@ class ContentExtractor:
 
         return content
 
+    @staticmethod
+    def _without_nested_lists(li: Tag) -> Tag:
+        """Копия пункта без вложенных списков: их проза выводит отдельными строками."""
+        view = li.__copy__()
+        for nested in view.find_all(["ul", "ol"], recursive=False):
+            nested.decompose()
+        return view
+
+    def _with_inherited_item_color(self, nested_list: Tag, color: str) -> Tag:
+        """Копия вложенного списка, где пункты без своего цвета (и без окрашенного
+        предка внутри списка) получают цвет родительского пункта — так их увидит
+        разметка пунктов (_process_list), как браузер видит унаследованный цвет."""
+        copy_ = nested_list.__copy__()
+        targets = []
+        for item in copy_.find_all("li"):
+            if self._element_own_color(item):
+                continue
+            cur = item.parent
+            inherited = False
+            while isinstance(cur, Tag) and cur is not copy_:
+                if self._element_own_color(cur):
+                    inherited = True
+                    break
+                cur = cur.parent
+            if not inherited:
+                targets.append(item)
+        for item in targets:
+            style = (item.get("style") or "").strip().rstrip(";")
+            item["style"] = f"{style}; color: {color}" if style else f"color: {color}"
+        return copy_
+
     def _process_list(self, element: Tag, context: str, indent_level: int = 0) -> str:
         """Обработка списков с правильными переводами строк"""
         if not self.config.format_lists:
@@ -1826,7 +1857,22 @@ class ContentExtractor:
                             item_counter += 1
                 continue
 
-            item_content = self._process_list_item_content(li, context, indent_level)
+            # Пункт, окрашенный ЦЕЛИКОМ (цвет на самом <li>), в прозе (1.9.13). Маркер
+            # ставился только на цветных потомках пункта, а текст прямо в <li> маркера не
+            # получал — вставка уходила в ПРОМ (в HTML-островах это починено в 1.9.8).
+            # Пункт без вложенных списков проходит общий путь _process_element: маркер,
+            # смешанное зачёркивание, частичное перекрытие чёрным, уплощение (ТЗ п. 4.5).
+            li_color = None
+            item_content = None
+            if (self.config.critic_mode and not self._critic_stack
+                    and not self._critic_suppress
+                    and self._is_edit_color(self._element_own_color(li))):
+                li_view = self._without_nested_lists(li)
+                if self._critic_marker_for(li_view) is not None:
+                    li_color = self._element_own_color(li)
+                    item_content = (self._process_element(li_view, context) or "").rstrip("\n")
+            if item_content is None:
+                item_content = self._process_list_item_content(li, context, indent_level)
 
             # ИСПРАВЛЕНО: Проверяем, что содержимое не пустое после trim
             if item_content and item_content.strip():
@@ -1838,6 +1884,9 @@ class ContentExtractor:
 
             nested_lists = li.find_all(["ul", "ol"], recursive=False)
             for nested_list in nested_lists:
+                if li_color:
+                    # вложенный список цветного пункта наследует его цвет (CSS)
+                    nested_list = self._with_inherited_item_color(nested_list, li_color)
                 nested_content = self._process_list(nested_list, context, indent_level + 1)
                 if nested_content:
                     list_items.append(nested_content)

@@ -70,7 +70,15 @@ _MD_TAG_RE = re.compile(r"</?(?:" + "|".join(_ISLAND_TAGS) + r")(?=[\s/>])[^<>]*
 # Нумерацию «N. » экспортёр пишет сам (в HTML источника её рисует браузер) — 28 ложных
 # «лишнее в ПРОМ: 1, 2, 3» на выгрузке КК.
 _MD_OL_NUMBER_RE = re.compile(r"^([ \t>]*)\d+\.[ \t]+", re.M)
-_SRC_PARA_NUMBER_RE = re.compile(r"^\s*\d+\.[ \t ]+")
+# Источник (1.9.13): «N. » в начале строки снимается так же, как в markdown — см.
+# source_word_sets. Начало строки, которое markdown не увидит как «N. », помечается
+# _NO_LINE_START: заголовок («## 1.»), пункт списка (перед ним номер экспортёра),
+# ячейка таблицы, жирный / код / ссылка («**1.», «`1.», «[1.»).
+_SRC_LINE_NUMBER_RE = re.compile(r"^[ \t\u00a0]*\d+\.[ \t\u00a0]+", re.M)
+_NO_LINE_START = "\u0001"
+_NO_LINE_START_ANCESTORS = ["td", "th", "li", "h1", "h2", "h3", "h4", "h5", "h6",
+                            "strong", "b", "code", "a"]
+_MD_TABLE_OPEN_RE = re.compile(r"<table(?=[\s>])")
 _MD_IMAGE_RE = re.compile(r"!\[[^\]]*\]\([^)]*\)")
 # Адрес ссылки — со скобками внутри (…-(Copy)?node-id=…, #id-…(2FAOperationStrategy)-x):
 # markdown допускает в адресе сбалансированные скобки; [^)]* обрывался на первой «)»,
@@ -78,8 +86,11 @@ _MD_IMAGE_RE = re.compile(r"!\[[^\]]*\]\([^)]*\)")
 _MD_LINK_TARGET_RE = re.compile(r"\]\((?:[^()]|\([^()]*\))*\)")
 # Служебная ячейка ±ID: знак + идентификатор задачи (PROJECT-123, UNKNOWN-ff00ff). Число
 # «-3» в ячейке — текст, не служебная ячейка (1.9.11).
+# Заголовок «status» НЕ вырезается (1.9.13): критик удаляет свой служебный столбец
+# сам при apply/reject, а столбец источника с именем «status» — текст (ложные
+# «потеряно: status» на [DEV]-страницах КК).
 _MD_STATUS_CELL_RE = re.compile(
-    r"\|\s*(?:status|[+\-±][A-Za-z][A-Za-z0-9_]*-[A-Za-z0-9]+)\s*(?=\|)")
+    r"\|\s*[+\-±][A-Za-z][A-Za-z0-9_]*-[A-Za-z0-9]+\s*(?=\|)")
 
 
 def words(text: str) -> Counter:
@@ -92,10 +103,26 @@ def strip_exporter_tags(text: str) -> str:
     return _MD_TAG_RE.sub(" ", text)
 
 
+def _strip_list_numbers(md: str) -> str:
+    """Снимает «N. » в начале строк вне HTML-островов (1.9.13).
+
+    Внутри острова (<table>…</table>) строка с цифры — текст ячейки: многострочная
+    HTML-таблица выводит <br> ячейки переводом строки, и «2. Кнопки…» после <br>
+    снималось как нумерация списка, хотя в источнике это текст ячейки (страница
+    «[КК] Бизнес-требования»: ложные «потеряно: 2…7»)."""
+    out = []
+    depth = 0
+    for line in md.split("\n"):
+        out.append(line if depth > 0 else _MD_OL_NUMBER_RE.sub(r"\1", line))
+        depth += len(_MD_TABLE_OPEN_RE.findall(line)) - line.count("</table>")
+        depth = max(depth, 0)
+    return "\n".join(out)
+
+
 def md_plain(md: str) -> str:
     """Markdown критик-выгрузки → текст без разметки (для подсчёта слов)."""
     # нумерация экспортёра; абзац «N. …» снимается симметрично в source_word_sets
-    s = _MD_OL_NUMBER_RE.sub(r"\1", md)
+    s = _strip_list_numbers(md)
     s = _MD_MARK_OPEN_RE.sub("", s)
     s = _MD_MARK_CLOSE_RE.sub("", s)
     s = _MD_IMAGE_RE.sub(" ", s)
@@ -141,23 +168,29 @@ def source_word_sets(raw_html: str, extractor) -> Tuple[Counter, Counter]:
     extractor._process_confluence_macros(soup)
     extractor._remove_empty_paragraphs(soup)
 
-    runs: List[Tuple[str, str]] = []   # (state, text); соседние прогоны одного состояния склеиваются
+    # Из источника строятся те же два среза, что даёт критик (1.9.13): срез ПРОМ —
+    # чёрное + удаления, срез apply — чёрное + вставки, в порядке документа. Строки —
+    # как в markdown: граница блока и <br> — перевод строки, перевод строки внутри
+    # обычного текста — пробел (HTML его схлопывает), внутри <pre> — строка. Нумерация
+    # «N. » снимается в начале строки КАЖДОГО среза — как md_plain снимает её в
+    # результатах reject/apply. Так номер, собранный из узлов разного цвета
+    # (<span цвет>5</span><s>4</s>. Информация — после reject «4. Информация»), номер в
+    # отдельном узле, после <br>, совпадает с markdown. Начало строки, которое
+    # markdown не увидит как «N. », помечается _NO_LINE_START (заголовок, пункт списка,
+    # ячейка, жирный / код / ссылка). До 1.9.13 снимался только номер в первом узле
+    # блока — десять страниц КК 1.9.11 давали ложные «потеряно / лишнее: 1, 2, 3».
+    pieces: List[Tuple[str, str]] = []   # (state, text) в порядке документа
+    at_line_start = True
 
-    def separator() -> None:
-        if runs:
-            runs[-1] = (runs[-1][0], runs[-1][1] + " ")
-
-    # Абзац прозы, начинающийся с «N. », в срезах reject/apply становится строкой
-    # «N. …», и md_plain снимает это как нумерацию — снимаем и здесь, симметрично, при
-    # любом цвете абзаца. В ячейках таблиц (pipe и острова) строка с цифры не
-    # начинается — там номер остаётся словом.
-    block_start = True
+    def tail(text: str) -> None:
+        """Перевод строки / разделитель: принадлежит обоим срезам."""
+        pieces.append(("sep", text))
 
     for node in soup.descendants:
         if isinstance(node, Tag):
             if node.name in _BLOCK_TAGS:
-                separator()
-                block_start = True
+                tail("\n")
+                at_line_start = True
             continue
         if isinstance(node, Comment) or not isinstance(node, NavigableString):
             continue
@@ -165,30 +198,24 @@ def source_word_sets(raw_html: str, extractor) -> Tuple[Counter, Counter]:
         if parent is not None and parent.name in ("script", "style"):
             continue
         text = str(node)
+        if node.find_parent("pre") is None:
+            text = text.replace("\r", " ").replace("\n", " ")
         if not text.strip():
-            separator()          # пробельный узел между инлайнами — разделитель
+            tail(" ")                     # пробельный узел между инлайнами — разделитель
             continue
-        state = _effective_state(node, extractor)
-        if block_start:
-            block_start = False
-            if node.find_parent(["td", "th"]) is None:
-                text = _SRC_PARA_NUMBER_RE.sub("", text, count=1)
-        if runs and runs[-1][0] == state:
-            runs[-1] = (state, runs[-1][1] + text)
-        else:
-            runs.append((state, text))
+        if at_line_start:
+            at_line_start = False
+            if node.find_parent(_NO_LINE_START_ANCESTORS) is not None:
+                text = _NO_LINE_START + text
+        pieces.append((_effective_state(node, extractor), text))
 
-    prom: Counter = Counter()
-    applied: Counter = Counter()
-    for state, text in runs:
-        w = words(strip_exporter_tags(text))
-        if state == "black":
-            prom += w
-            applied += w
-        elif state == "del":
-            prom += w
-        else:
-            applied += w
+    def view(keep: Tuple[str, ...]) -> Counter:
+        txt = "".join(t for st, t in pieces if st == "sep" or st in keep)
+        txt = _SRC_LINE_NUMBER_RE.sub("", txt).replace(_NO_LINE_START, "")
+        return words(strip_exporter_tags(txt))
+
+    prom = view(("black", "del"))
+    applied = view(("black", "ins"))
     return prom, applied
 
 
