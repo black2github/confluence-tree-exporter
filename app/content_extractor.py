@@ -1331,13 +1331,11 @@ class ContentExtractor:
             parts.append(str(text_node))
         return re.sub(r"\s+", " ", "".join(parts)).strip()
 
-    def _flatten_nested_critic(self, element: Tag) -> str:
-        """Уплощает вложенную конструкцию цветов в ОДИН маркер (ТЗ п. 4.5).
-
-        Зачёркнутый черновик отбрасывается; выживший текст оборачивается целиком под
-        идентификатор ВНУТРЕННЕЙ (самой глубокой = более поздней) задачи. Конструкция
-        записывается в отчёт как черновая — требует ручной проверки аналитиком.
-        """
+    def _flatten_nested_parts(self, element: Tag) -> Tuple[Optional[str], str]:
+        """Общая часть уплощения вложенной конструкции цветов (ТЗ п. 4.5) для обеих
+        нотаций — текстовой (_flatten_nested_critic) и HTML-островов
+        (_flatten_nested_critic_html): запись в отчёт, задача ВНУТРЕННЕГО (самого
+        глубокого = более позднего) цвета и выживший текст без зачёркнутого черновика."""
         colored = self._critic_colored_descendants(element)
         # Самый глубокий цвет = внутренняя (поздняя) задача.
         deepest_norm = max(colored, key=lambda c: c[1])[0] if colored else None
@@ -1353,11 +1351,36 @@ class ContentExtractor:
         self._critic_report.append(
             {"tasks": tasks, "html": str(element), "confidence": "high"})
 
-        surviving = self._collect_flattened_text(element)
+        return inner_task, self._collect_flattened_text(element)
+
+    def _flatten_nested_critic(self, element: Tag) -> str:
+        """Уплощает вложенную конструкцию цветов в ОДИН маркер (ТЗ п. 4.5).
+
+        Зачёркнутый черновик отбрасывается; выживший текст оборачивается целиком под
+        идентификатор ВНУТРЕННЕЙ (самой глубокой = более поздней) задачи. Конструкция
+        записывается в отчёт как черновая — требует ручной проверки аналитиком.
+        """
+        inner_task, surviving = self._flatten_nested_parts(element)
         if not surviving or inner_task is None:
             return ""
         # Всегда вставка: выживший текст — это новое состояние под поздней задачей.
         return f"{{++{inner_task}: {surviving}++}}"
+
+    def _flatten_nested_critic_html(self, element: Tag) -> str:
+        """То же уплощение в HTML-нотации островов (ТЗ п. 4.7): один
+        <span class="critic-ins"> под внутренней задачей.
+
+        До FB-40 КК (2026-10-28) острова уплощения не знали: внешний элемент получал
+        маркер своей задачи, рекурсия шла с непустым стеком, и внутренний цвет другой
+        задачи маркера не получал («[<cc99ff>[<ff00ff>0..</ff00ff>1]</cc99ff>]» на
+        странице 2166861010 — один critic-ins внешней задачи, черновик внутренней
+        уходил в ПРОМ с внешней). Четвёртый дефект семейства «три пути разметки».
+        """
+        inner_task, surviving = self._flatten_nested_parts(element)
+        if not surviving or inner_task is None:
+            return ""
+        return (f'<span class="critic-ins" data-task="{inner_task}">'
+                f'{_escape_stray_tag_openers(surviving)}</span>')
 
     def _cell_uniform_critic(self, cell: Tag):
         """Возвращает (task, kind), если ВЕСЬ видимый текст ячейки окрашен одной задачей.
@@ -2458,6 +2481,10 @@ class ContentExtractor:
                 li_marker = self._critic_marker_for(li)
                 if li_marker is not None:
                     li_norm = normalize_color(self._element_own_color(li) or "")
+                    # вложенный цвет другой задачи — уплощение, как в прозе (ТЗ п. 4.5)
+                    if self._has_nested_diff_color(li, li_norm):
+                        parts.append(f"<li>{self._flatten_nested_critic_html(li)}</li>")
+                        continue
                     if li_marker[1] == "del" and not self._is_fully_struck(li):
                         # цветной пункт с частично зачёркнутым текстом — чередование
                         # critic-del/critic-ins, как для ячейки (1.9.3)
@@ -2476,6 +2503,9 @@ class ContentExtractor:
                     if marker is not None:
                         task, kind = marker
                         norm = normalize_color(self._element_own_color(child) or "")
+                        if self._has_nested_diff_color(child, norm):
+                            li_parts.append(self._flatten_nested_critic_html(child))
+                            continue
                         if kind == "del" and not self._is_fully_struck(child):
                             li_parts.append(self._split_mixed_strike_html(child, task, norm))
                             continue
@@ -2816,6 +2846,13 @@ class ContentExtractor:
                         # часть текста — чередование critic-del/critic-ins одной
                         # задачи, как _split_mixed_strike для текстовых маркеров.
                         norm = normalize_color(self._element_own_color(child) or "")
+                        # Вложенный цвет другой задачи (ТЗ п. 4.5) — уплощение, как в прозе
+                        # (_process_element): один маркер под внутренней задачей, запись в
+                        # отчёт. Порядок проверок прозы: уплощение раньше смешанного
+                        # зачёркивания и частичного перекрытия чёрным (FB-40 КК, 2026-10-28).
+                        if self._has_nested_diff_color(child, norm):
+                            result_parts.append(self._flatten_nested_critic_html(child))
+                            continue
                         if kind == "del" and not self._is_fully_struck(child):
                             result_parts.append(self._split_mixed_strike_html(child, task, norm))
                             continue

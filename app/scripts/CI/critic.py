@@ -286,10 +286,13 @@ def _matches(task_id: Optional[str], found_id: str) -> bool:
     return task_id is None or found_id == task_id
 
 
-def _apply_inline(region_text: str, op: str, task_id: Optional[str]) -> Tuple[str, int]:
+def _apply_inline(region_text: str, op: str, task_id: Optional[str],
+                  hit: str = "") -> Tuple[str, int]:
     """Применяет/откатывает inline-маркеры целевой задачи (ТЗ п. 5.2).
 
     Маркеры прочих задач остаются нетронутыми — это принципиально (ТЗ п. 5.2).
+    hit — метка, которая ставится на место каждого снятого маркера (см.
+    _drop_emptied_items); по умолчанию пустая — текст тот же, что прежде.
     """
     count = 0
 
@@ -298,21 +301,21 @@ def _apply_inline(region_text: str, op: str, task_id: Optional[str]) -> Tuple[st
         if not _matches(task_id, m.group(1)):
             return m.group(0)
         count += 1
-        return m.group(2) if op == "apply" else ""
+        return (m.group(2) if op == "apply" else "") + hit
 
     def repl_del(m):
         nonlocal count
         if not _matches(task_id, m.group(1)):
             return m.group(0)
         count += 1
-        return "" if op == "apply" else m.group(2)
+        return ("" if op == "apply" else m.group(2)) + hit
 
     def repl_sub(m):
         nonlocal count
         if not _matches(task_id, m.group(1)):
             return m.group(0)
         count += 1
-        return m.group(3) if op == "apply" else m.group(2)
+        return (m.group(3) if op == "apply" else m.group(2)) + hit
 
     region_text = _INS_RE.sub(repl_ins, region_text)
     region_text = _DEL_RE.sub(repl_del, region_text)
@@ -557,6 +560,7 @@ def _transform_html_island(island: str, op: str, task_id: Optional[str]) -> Tupl
     """Мутирует critic-элементы внутри одного HTML-острова по таблице ТЗ п. 4.7."""
     soup = BeautifulSoup(island, "html.parser")
     count = 0
+    touched_li: list = []        # пункты, где снят маркер, — кандидаты в опустевшие
 
     # span.critic-ins / span.critic-del
     for span in soup.find_all("span", class_=lambda c: c and (
@@ -567,6 +571,9 @@ def _transform_html_island(island: str, op: str, task_id: Optional[str]) -> Tupl
             continue
         is_ins = _has_class(span, "critic-ins")
         count += 1
+        li = span.find_parent("li")
+        if li is not None:
+            touched_li.append(li)
         # apply: ins → снять обёртку (оставить), del → удалить с содержимым.
         # reject: ins → удалить с содержимым, del → снять обёртку (оставить).
         keep = (op == "apply" and is_ins) or (op == "reject" and not is_ins)
@@ -595,12 +602,80 @@ def _transform_html_island(island: str, op: str, task_id: Optional[str]) -> Tupl
         else:
             tr.decompose()
 
+    count += _drop_emptied_li(touched_li)
     return (str(soup), count) if count else (island, 0)
+
+
+def _drop_emptied_li(touched: list) -> int:
+    """Удаляет пункт <li>, в котором сняли маркер и не осталось ни текста, ни картинки,
+    ни таблицы; затем — список <ul>/<ol>, оставшийся без пунктов по этой причине.
+    Пустые списки без снятого маркера (они есть в выгрузке) не трогаются (FB-40 КК)."""
+    count = 0
+    lists = []
+    for li in touched:
+        if _is_destroyed(li) or li.get_text().strip() or li.find(["img", "table"]):
+            continue
+        parent = li.parent
+        li.decompose()
+        count += 1
+        if parent is not None and parent.name in ("ul", "ol"):
+            lists.append(parent)
+    for lst in lists:
+        if (not _is_destroyed(lst) and not lst.find("li") and not lst.get_text().strip()
+                and not lst.find(["img", "table"])):
+            lst.decompose()
+    return count
 
 
 # --------------------------------------------------------------------------------------
 # Обработка одного файла.
 # --------------------------------------------------------------------------------------
+
+# --------------------------------------------------------------------------------------
+# Пункт списка, опустевший после снятия маркеров (FB-40 КК, 2026-10-28).
+#
+# Пункт, целиком состоящий из вставки невведённой задачи, после reject оставлял строку
+# «    * » без текста (срез КК: 92 строки на 23 страницах), и она уходила в карточки.
+# Симметрично — пункт целиком из удаления после apply. Снимается только строка, где
+# стоял снятый маркер и не осталось ничего, кроме маркера списка; пустые пункты
+# источника (без маркера) — его свойство и остаются. Родитель с непустыми детьми
+# остаётся: иначе дети сменили бы уровень.
+# --------------------------------------------------------------------------------------
+
+_HIT = "\x00"   # метка места снятого маркера: ставит inline-пас, снимает _drop_emptied_items
+_BARE_ITEM_RE = re.compile(r"^([ \t]*)(?:[*+-]|\d+[.)])[ \t]*$")
+
+
+def _indent(line: str) -> int:
+    s = line.expandtabs(4)
+    return len(s) - len(s.lstrip(" "))
+
+
+def _drop_emptied_items(text: str) -> Tuple[str, int]:
+    """Удаляет строку-пункт списка, ставшую пустой из-за снятого маркера, и снимает метки.
+
+    Обход снизу вверх: потомки решаются раньше родителя. Пункт остаётся, если следующая
+    непустая оставшаяся строка отступлена глубже (у него есть потомки или продолжение).
+    """
+    if _HIT not in text:
+        return text, 0
+    lines = text.splitlines(keepends=True)
+    keep = [True] * len(lines)
+    count = 0
+    next_indent: Optional[int] = None    # отступ следующей непустой оставшейся строки
+    for i in range(len(lines) - 1, -1, -1):
+        body = lines[i].rstrip("\r\n")
+        clean = body.replace(_HIT, "")
+        if _HIT in body:
+            m = _BARE_ITEM_RE.match(clean)
+            if m and (next_indent is None or next_indent <= _indent(m.group(1))):
+                keep[i] = False
+                count += 1
+                continue
+        if clean.strip():
+            next_indent = _indent(clean)
+    return "".join(ln.replace(_HIT, "") for ln, k in zip(lines, keep) if k), count
+
 
 def process_text(text: str, op: str, task_id: Optional[str],
                  status_column: str = STATUS_COLUMN,
@@ -620,9 +695,12 @@ def process_text(text: str, op: str, task_id: Optional[str],
             continue
         _validate_inline(region_text, base_line, path)
         region_text, c_html = _apply_html(region_text, op, task_id)
-        region_text, c_inline = _apply_inline(region_text, op, task_id)
+        # метка — только если такого символа в тексте нет (иначе пункты не снимаются)
+        hit = _HIT if _HIT not in region_text else ""
+        region_text, c_inline = _apply_inline(region_text, op, task_id, hit)
+        region_text, c_items = _drop_emptied_items(region_text)
         region_text, c_table = _apply_tables(region_text, op, task_id, status_column)
-        total += c_html + c_inline + c_table
+        total += c_html + c_inline + c_items + c_table
         out.append(region_text)
     return "".join(out), total
 
