@@ -522,13 +522,13 @@ def check_cards(raw_root: Path, docs: Path, introduced: Set[str],
 
 def cards_report(rows: List[CardRow], stats: Dict[str, int], introduced: Set[str],
                  docs: Path, raw_root: Path) -> List[str]:
+    """Раздел 1 отчёта --cards: удалённое введёнными задачами осталось в карточках."""
     esc = lambda x: str(x).replace("|", "\\|")  # noqa: E731
-    out = ["# Сверка по архиву raw: удалённое введёнными задачами осталось в карточках комплекта", "",
-           f"Комплект: `{docs}`; архив: `{raw_root}`; введённые задачи: {', '.join(sorted(introduced)) or '—'}.",
+    out = ["## 1. Удалённое введёнными задачами осталось в карточках", "",
            "Сигнал — фрагмент, который в архиве raw стоит под маркером удаления введённой задачи, дословно "
            "(после нормализации) присутствует в карточке-потребителе страницы чаще, чем в архиве вне "
            "удалений введённых задач: снятие не доведено до карточки (дозаход после ввода задачи).", "",
-           "## Сводка", "",
+           "### Сводка", "",
            f"- страниц архива raw с маркерами удаления введённых задач: {stats['pages']}, из них без карточки-"
            f"потребителя: {stats['pages_no_card']}; карточек проверено: {stats['cards']};",
            f"- удалённых фрагментов проверено: {stats['checked']}; находок: {stats['findings']};",
@@ -545,12 +545,12 @@ def cards_report(rows: List[CardRow], stats: Dict[str, int], introduced: Set[str
     for r in rows:
         by_task[r.task] = by_task.get(r.task, 0) + 1
         by_card[r.card] = by_card.get(r.card, 0) + 1
-    out += ["### По задачам", "", "| Задача | Находок |", "|---|---|"]
+    out += ["#### По задачам", "", "| Задача | Находок |", "|---|---|"]
     out += [f"| {t} | {n} |" for t, n in sorted(by_task.items())]
-    out += ["", "### По карточкам", "", "| Карточка | Находок |", "|---|---|"]
+    out += ["", "#### По карточкам", "", "| Карточка | Находок |", "|---|---|"]
     out += [f"| {esc(c)} | {n} |" for c, n in sorted(by_card.items(), key=lambda x: (-x[1], x[0]))]
     n_check = sum(1 for r in rows if r.check)
-    out += ["", "## Находки", "",
+    out += ["", "### Находки", "",
             f"«проверить» — фрагмент из {CHECK_WORDS} слов или короче {CHECK_CHARS} символов: общая фраза "
             f"может совпасть случайно, решает человек ({n_check} из {len(rows)}).", "",
             "| Карточка | Раздел карточки | Страница | Задача | Фрагмент (первые 120 символов) | Строка карточки | Проверить |",
@@ -560,6 +560,260 @@ def cards_report(rows: List[CardRow], stats: Dict[str, int], introduced: Set[str
         out.append(f"| {esc(r.card)} | {esc(r.section) or '—'} | {r.page} | {r.task} | {esc(frag)}"
                    + (f" ×{r.count}" if r.count > 1 else "") + f" | {r.line} | "
                    + ("проверить" if r.check else "") + " |")
+    return out
+
+
+# ======================================================================================
+# Режим карточек, раздел 2 (линия 1 доводки 5.3 КК, решение владельца 30.10): зеркало раздела 1 —
+# ВСТАВКА НЕвведённой задачи из архива raw дословно присутствует в карточке-потребителе страницы
+# чаще, чем в срезе «как должен быть» (raw без удалений введённых и без вставок невведённых) и
+# чем в применённой копии sources/confluence: содержимое невведённой задачи попало в карточку
+# ПРОМ-среза (ревью 5.2 находило это вручную). Дополняет ревью, не заменяет: карточка, взявшая
+# часть фрагмента или переложившая строку таблицы, и короткие вставки сюда не попадают.
+# ======================================================================================
+
+# data-task, которые не являются задачами: src/PROM — тег состояния ПРОМ, не задача
+NOT_TASKS = {"PROM"}
+_INS_TOKEN_RE = re.compile(r"(?<![\w-])\+" + _TASK + r"(?![\w-])")
+_CARD_ID_RE = re.compile(r"^id:\s*['\"]?([A-Za-z0-9][\w.-]*)", re.M)
+
+
+@dataclass
+class InsRow:
+    card: str
+    card_id: str
+    page: str
+    task: str
+    fragment: str
+    line: int
+    count: int
+    section: str = ""
+    check: bool = False
+    covered: bool = False      # задача и ID карточки — в одной строке матрицы (долг зарегистрирован)
+    unapproved: Optional[bool] = None   # задача в sandbox/confluence-unapproved-jira-pages.md
+    matrix_line: int = 0       # строка матрицы: покрывающая, иначе первая с задачей; 0 — нет
+
+
+def check_page_ins(raw_text: str, target_text: str, introduced: Set[str],
+                   applied_text: Optional[str] = None,
+                   include_nested: bool = True) -> PageReport:
+    """Вставки невведённых задач против текста цели (карточки). «Законно» — сколько раз фрагмент
+    стоит в срезе raw (без удалений введённых и без вставок невведённых) или в применённой копии
+    страницы, большее из двух; без копии — только по срезу raw."""
+    return _ins_match(_ins_prepare(raw_text, introduced, applied_text), target_text, include_nested)
+
+
+def _ins_prepare(raw_text: str, introduced: Set[str],
+                 applied_text: Optional[str]) -> Tuple[List[Fragment], str, str]:
+    """Разбор страницы один раз на все её карточки: (чужие вставки, срез raw, копия)."""
+    ins_all = collect_ins_fragments(raw_text)
+    foreign = [f for f in ins_all
+               if f.task and f.task not in introduced and f.task not in NOT_TASKS and f.norm]
+    if not foreign:
+        return [], "", ""
+    dels = [f for f in collect_del_fragments(raw_text) if f.task in introduced]
+    raw_kept, _ = _norm_lines(raw_text)
+    gone = dels + [f for f in ins_all if f.task not in introduced]
+    for f in sorted(gone, key=lambda x: -len(x.norm)):
+        if f.norm:
+            raw_kept = raw_kept.replace(f.norm, " ", 1)
+    applied_norm = _norm_lines(applied_text)[0] if applied_text else ""
+    return foreign, raw_kept, applied_norm
+
+
+def _ins_match(prep: Tuple[List[Fragment], str, str], target_text: str,
+               include_nested: bool) -> PageReport:
+    rep = PageReport()
+    foreign, raw_kept, applied_norm = prep
+    if not foreign:
+        return rep
+    target_norm, starts = _norm_lines(target_text)
+    seen: Set[Tuple[str, str]] = set()
+    for f in foreign:
+        if f.nested and not include_nested:
+            rep.nested += 1
+            continue
+        if not _long_enough(f.norm):
+            rep.short += 1
+            continue
+        rep.checked += 1
+        key = (f.task, f.norm)
+        if key in seen:
+            continue
+        seen.add(key)
+        in_target = target_norm.count(f.norm)
+        if not in_target:
+            continue
+        allowed = max(raw_kept.count(f.norm), applied_norm.count(f.norm))
+        if in_target > allowed:
+            rep.findings.append(Finding(f.task, f.kind, f.norm, in_target - allowed,
+                                        _line_of(starts, target_norm.find(f.norm))))
+        else:
+            rep.kept_elsewhere += 1
+    return rep
+
+
+def _id_re(ident: str) -> "re.Pattern[str]":
+    return re.compile(r"(?<![\w-])" + re.escape(ident) + r"(?![\w-])")
+
+
+def _registration(task: str, card_id: str, matrix_lines: List[str],
+                  unapproved_text: Optional[str]) -> Tuple[bool, int, Optional[bool]]:
+    """(покрыто долгом, строка матрицы, в списке unapproved). Покрыто — задача упомянута в строке
+    матрицы, где стоит и ID этой карточки (так решает ревью 5.2; долг без ID карточки не
+    покрывает — прецедент 5.1). Строка матрицы — покрывающая, иначе первая с задачей."""
+    t_re = _id_re(task)
+    c_re = _id_re(card_id) if card_id else None
+    first = covering = 0
+    for i, ln in enumerate(matrix_lines, 1):
+        if not t_re.search(ln):
+            continue
+        first = first or i
+        if c_re is not None and c_re.search(ln):
+            covering = i
+            break
+    unapproved = None if unapproved_text is None else bool(t_re.search(unapproved_text))
+    return bool(covering), covering or first, unapproved
+
+
+def check_cards_ins(raw_root: Path, docs: Path, introduced: Set[str],
+                    applied_root: Optional[Path] = None, include_nested: bool = True,
+                    matrix: Optional[Path] = None,
+                    unapproved: Optional[Path] = None) -> Tuple[List[InsRow], Dict[str, int]]:
+    """Вставки невведённых задач против карточек-потребителей страниц. Матрица — по умолчанию
+    docs/traceability-matrix.md, список unapproved — <комплект>/sandbox/confluence-unapproved-jira-pages.md;
+    нет файла — столбец «регистрация» пишет «—»/«?»."""
+    stats = {"pages": 0, "pages_no_card": 0, "no_copy": 0, "cards": 0, "checked": 0, "short": 0,
+             "nested": 0, "kept": 0, "excluded": 0, "findings": 0, "main": 0, "check": 0, "covered": 0}
+    rows: List[InsRow] = []
+    cards = index_cards(docs)
+    matrix = matrix or docs / "traceability-matrix.md"
+    unapproved = unapproved or docs.parent / "sandbox" / "confluence-unapproved-jira-pages.md"
+    matrix_lines = (matrix.read_text(encoding="utf-8", errors="replace").splitlines()
+                    if matrix.is_file() else [])
+    unapproved_text = (unapproved.read_text(encoding="utf-8", errors="replace")
+                       if unapproved.is_file() else None)
+    copies = index_pages(applied_root, skip_dirs=("raw",)) if applied_root and applied_root.is_dir() else {}
+    seen_cards: Set[Path] = set()
+    for raw in sorted(raw_root.rglob("*.md")):
+        try:
+            text = raw.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        # дешёвый отсев страниц без вставок: bs4 — только там, где маркер вставки есть
+        if not ("critic-ins" in text or "critic-row-ins" in text or "{++" in text or "~>" in text
+                or _INS_TOKEN_RE.search(text)):
+            continue
+        pid = page_id_of(text)
+        if pid is None:
+            continue
+        targets = cards.get(pid, [])
+        if not targets:
+            # без карточки — только счётчик: срез raw и копия не нужны
+            if any(f.task and f.task not in introduced and f.task not in NOT_TASKS and f.norm
+                   for f in collect_ins_fragments(text)):
+                stats["pages"] += 1
+                stats["pages_no_card"] += 1
+            continue
+        copy = copies.get(pid)
+        applied_text = copy.read_text(encoding="utf-8", errors="replace") if copy else None
+        prep = _ins_prepare(text, introduced, applied_text)
+        if not prep[0]:
+            continue
+        stats["pages"] += 1
+        if copy is None:
+            stats["no_copy"] += 1
+        for card in targets:
+            seen_cards.add(card)
+            full = card.read_text(encoding="utf-8", errors="replace")
+            m_id = _CARD_ID_RE.search(full[:4000])
+            card_id = m_id.group(1) if m_id else ""
+            masked, _n = card_mask(full)
+            rep = _ins_match(prep, masked, include_nested)
+            rep_full = _ins_match(prep, full, include_nested)
+            stats["checked"] += rep.checked
+            stats["short"] += rep.short
+            stats["nested"] += rep.nested
+            stats["kept"] += rep.kept_elsewhere
+            stats["excluded"] += max(0, len(rep_full.findings) - len(rep.findings))
+            try:
+                rel = card.relative_to(docs).as_posix()
+            except ValueError:
+                rel = card.as_posix()
+            for f in rep.findings:
+                covered, mline, unappr = _registration(f.task, card_id, matrix_lines, unapproved_text)
+                row = InsRow(rel, card_id, pid, f.task, f.norm, f.line, f.count,
+                             _section_at(full, f.line),
+                             len(f.norm.split()) <= CHECK_WORDS or len(f.norm) < CHECK_CHARS,
+                             covered, unappr, mline)
+                rows.append(row)
+                stats["findings"] += 1
+                # покрытое долгом — в свою таблицу, даже если короткое: решение о нём уже принято
+                stats["covered" if covered else "check" if row.check else "main"] += 1
+    stats["cards"] = len(seen_cards)
+    return rows, stats
+
+
+def cards_ins_report(rows: List[InsRow], stats: Dict[str, int]) -> List[str]:
+    """Раздел 2 отчёта --cards: вставки невведённых задач присутствуют в карточках."""
+    esc = lambda x: str(x).replace("|", "\\|")  # noqa: E731
+    out = ["## 2. Вставки невведённых задач присутствуют в карточках", "",
+           "Сигнал — фрагмент, который в архиве raw стоит под маркером вставки НЕвведённой задачи, "
+           "дословно (после нормализации) присутствует в карточке-потребителе страницы чаще, чем в "
+           "срезе «как должен быть» (архив без удалений введённых задач и без вставок невведённых) и "
+           "чем в применённой копии страницы: содержимое невведённой задачи попало в карточку. "
+           "Дополняет ревью, не заменяет: часть фрагмента, переложенная строка таблицы и короткие "
+           "вставки сюда не попадают.", "",
+           "### Сводка", "",
+           f"- страниц архива raw со вставками невведённых задач: {stats['pages']}, из них без "
+           f"карточки-потребителя: {stats['pages_no_card']}, без применённой копии (сверка только по "
+           f"архиву): {stats['no_copy']}; карточек проверено: {stats['cards']};",
+           f"- вставок проверено: {stats['checked']}; находок: {stats['findings']} — основной список "
+           f"{stats['main']}, «проверить» {stats['check']}, покрыто долгом матрицы {stats['covered']};",
+           f"- пропущено: короткие (меньше {MIN_WORDS} слов или {MIN_CHARS} символов) {stats['short']}, "
+           f"в ячейках вложенных таблиц {stats['nested']}, законно в срезе или в применённой копии "
+           f"{stats['kept']}, только в разделах «Происхождение», «Долги и открытые вопросы» и т. п. "
+           f"или в строках долга / OQ {stats['excluded']}.", ""]
+    if not rows:
+        out.append("**Находок нет** — содержимое невведённых задач в карточках не найдено.")
+        return out
+    by_task: Dict[str, int] = {}
+    by_card: Dict[str, int] = {}
+    for r in rows:
+        by_task[r.task] = by_task.get(r.task, 0) + 1
+        by_card[r.card] = by_card.get(r.card, 0) + 1
+    out += ["#### По задачам", "", "| Задача | Находок |", "|---|---|"]
+    out += [f"| {t} | {n} |" for t, n in sorted(by_task.items(), key=lambda x: (-x[1], x[0]))]
+    out += ["", "#### По карточкам", "", "| Карточка | Находок |", "|---|---|"]
+    out += [f"| {esc(c)} | {n} |" for c, n in sorted(by_card.items(), key=lambda x: (-x[1], x[0]))]
+    head = ["| Карточка | Раздел карточки | Страница | Задача | Фрагмент (первые 120 символов) | "
+            "Строка карточки | ×лишних | Регистрация |", "|---|---|---|---|---|---|---|---|"]
+
+    def table(title: str, note: str, part: List[InsRow]) -> List[str]:
+        res = ["", f"### {title} — {len(part)}", "", note, ""]
+        if not part:
+            return res + ["Нет."]
+        res += head
+        for r in sorted(part, key=lambda x: (x.card, x.line)):
+            frag = r.fragment[:120] + ("…" if len(r.fragment) > 120 else "")
+            reg = ("unapproved: " + ("?" if r.unapproved is None else "да" if r.unapproved else "нет")
+                   + "; матрица: " + (f"L{r.matrix_line}" if r.matrix_line else "—"))
+            res.append(f"| {esc(r.card)} | {esc(r.section) or '—'} | {r.page} | {r.task} | {esc(frag)} | "
+                       f"{r.line} | {r.count} | {reg} |")
+        return res
+
+    out += table("Основной список",
+                 "Находки длиннее порога «проверить», задача не покрыта долгом матрицы с ID этой "
+                 "карточки — к исполнителю.",
+                 [r for r in rows if not r.covered and not r.check])
+    out += table("Проверить",
+                 f"Фрагмент из {CHECK_WORDS} слов или короче {CHECK_CHARS} символов: общая фраза могла "
+                 "совпасть случайно, решает человек.",
+                 [r for r in rows if not r.covered and r.check])
+    out += table("Покрыто долгом матрицы",
+                 "Задача упомянута в строке `docs/traceability-matrix.md` вместе с ID этой карточки — "
+                 "долг зарегистрирован; долг без ID карточки не покрывает.",
+                 [r for r in rows if r.covered])
     return out
 
 
@@ -580,10 +834,14 @@ def _introduced_from_git(raw_root: Path) -> Set[str]:
 def main(argv: Optional[List[str]] = None) -> int:
     import argparse
     import time
-    ap = argparse.ArgumentParser(description="Сверка по архиву raw: удалённое введёнными задачами "
-                                             "введённых задач в карточках docs/ (отчёт markdown)")
+    ap = argparse.ArgumentParser(description="Сверка по архиву raw карточек docs/ (отчёт markdown): "
+                                             "удалённое введёнными задачами осталось; вставки "
+                                             "невведённых задач присутствуют")
     ap.add_argument("--cards", type=Path, required=True, help="каталог docs/ комплекта")
     ap.add_argument("--raw", type=Path, required=True, help="архив выгрузки sources/raw")
+    ap.add_argument("--applied", type=Path, default=None,
+                    help="применённые копии страниц (по умолчанию <raw>/../confluence); для раздела "
+                         "вставок: фрагмент, который есть в копии, законен")
     ap.add_argument("--introduced", type=Path, default=None,
                     help="файл с ID введённых задач (по строке); без ключа — теги src/* с HEAD")
     ap.add_argument("--skip-nested-cells", action="store_true",
@@ -598,12 +856,22 @@ def main(argv: Optional[List[str]] = None) -> int:
                if ln.strip() and not ln.strip().startswith("#")}
     else:
         ids = _introduced_from_git(a.raw)
+    applied = a.applied if a.applied is not None else a.raw.parent / "confluence"
     rows, stats = check_cards(a.raw, a.cards, ids, not a.skip_nested_cells)
-    lines = cards_report(rows, stats, ids, a.cards, a.raw)
+    ins_rows, ins_stats = check_cards_ins(a.raw, a.cards, ids, applied, not a.skip_nested_cells)
+    lines = ["# Сверка по архиву raw: карточки комплекта", "",
+             f"Комплект: `{a.cards}`; архив: `{a.raw}`; применённые копии: `{applied}`"
+             + ("" if applied.is_dir() else " (нет — раздел 2 сверяется только по архиву)")
+             + f"; введённые задачи: {', '.join(sorted(ids)) or '—'}.", ""]
+    lines += cards_report(rows, stats, ids, a.cards, a.raw)
+    lines += [""] + cards_ins_report(ins_rows, ins_stats)
     lines += ["", f"Время прогона: {time.time() - t0:.1f} с."]
     a.out.parent.mkdir(parents=True, exist_ok=True)
     a.out.write_text("\n".join(lines) + "\n", encoding="utf-8")
-    print(f"находок {stats['findings']} в {stats['cards']} карточках; отчёт: {a.out}")
+    print(f"удалённое введёнными: находок {stats['findings']} в {stats['cards']} карточках; "
+          f"вставки невведённых: основной список {ins_stats['main']} (проверить {ins_stats['check']}, "
+          f"покрыто долгом {ins_stats['covered']}; всего {ins_stats['findings']} в "
+          f"{len({r.card for r in ins_rows})} карточках); отчёт: {a.out}")
     return 0
 
 
