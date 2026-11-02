@@ -1,4 +1,5 @@
 # app/scripts/CI/raw_oracle.py
+# Слой: миграция
 """Raw-оракул снятий (FB-32 КК, решение владельца канона 23.10, ход 24.10).
 
 ЗАЧЕМ. Архив выгрузки `sources/raw` несёт истинные пометки правок задач в CriticMarkup;
@@ -79,6 +80,7 @@ class Fragment:
     line: int          # строка raw
     nested: bool = False
     norm: str = ""
+    io: str = ""       # строка таблицы: «запрос» / «ответ» по заголовку над таблицей, иначе пусто
 
 
 @dataclass
@@ -88,6 +90,8 @@ class Finding:
     norm: str
     count: int         # сколько раз «лишний» фрагмент найден в цели
     line: int          # первая строка цели
+    row: bool = False  # строка таблицы невведённой задачи, найдена по имени параметра
+    row_check: bool = False  # то же, но вид таблицы (запрос/ответ) не определён — «проверить»
 
 
 @dataclass
@@ -592,6 +596,7 @@ class InsRow:
     covered: bool = False      # задача и ID карточки — в одной строке матрицы (долг зарегистрирован)
     unapproved: Optional[bool] = None   # задача в sandbox/confluence-unapproved-jira-pages.md
     matrix_line: int = 0       # строка матрицы: покрывающая, иначе первая с задачей; 0 — нет
+    row_key: bool = False      # строка таблицы невведённой задачи, найдена по имени параметра
 
 
 def check_page_ins(raw_text: str, target_text: str, introduced: Set[str],
@@ -618,7 +623,81 @@ def _ins_prepare(raw_text: str, introduced: Set[str],
         if f.norm:
             raw_kept = raw_kept.replace(f.norm, " ", 1)
     applied_norm = _norm_lines(applied_text)[0] if applied_text else ""
+    for f in foreign:
+        if f.kind in _ROW_KINDS:
+            f.io = _io_kind(_section_at(raw_text, f.line))
     return foreign, raw_kept, applied_norm
+
+
+# Строки таблиц невведённых задач (замечание аналитиков КК 02.11, PRODOFF_CREDENTIALS_LIST,
+# GBO-145866): вставка — целиком строка таблицы, карточка переложила её своей строкой, и
+# дословного совпадения фрагмента нет. Сигнал — имя параметра (первая непустая ячейка строки,
+# даже короче порога), стоящее в колонке названия/параметра таблицы карточки чаще, чем в срезе
+# raw и в применённой копии. Отдельная рубрика отчёта.
+_ROW_KEY_COL_RE = re.compile(r"назван|параметр|поле|тег|атрибут|элемент|реквизит", re.I)
+_ROW_KINDS = ("html-row", "md-row")
+
+
+# имя параметра — одно слово с буквой, от 3 знаков (PRODOFF_CREDENTIALS_LIST, ProcessName,
+# …/Params/X): номера строк, коды статусов («5», «11») и фразы ключом строки не считаются
+_ROW_KEY_RE = re.compile(r"^[a-zа-яё_][\w./-]{2,}$")
+
+
+def _row_key(f: Fragment) -> str:
+    """Имя параметра строки-вставки: первая непустая ячейка (нормализованная), если она похожа
+    на имя параметра; иначе пусто (строка ключом не ловится)."""
+    if f.kind == "html-row":
+        soup = BeautifulSoup(f.text, "html.parser")
+        cells = soup.find_all(["td", "th"], recursive=False) or soup.find_all(["td", "th"])
+        texts = [c.decode_contents() for c in cells]
+    else:
+        texts = f.text.split(" | ")
+    key = next((k for k in (normalize(t) for t in texts) if k), "")
+    return key if _ROW_KEY_RE.match(key) else ""
+
+
+def _card_key_cells(target_text: str) -> List[Tuple[str, int]]:
+    """(нормализованная ячейка, строка) колонок названия/параметра markdown-таблиц карточки;
+    у таблицы без такой колонки — первая колонка."""
+    out: List[Tuple[str, int]] = []
+    lines = target_text.split("\n")
+    i = 0
+    while i < len(lines):
+        if not lines[i].lstrip().startswith("|"):
+            i += 1
+            continue
+        j = i
+        while j < len(lines) and lines[j].lstrip().startswith("|"):
+            j += 1
+        block = [_critic._split_row_parts(ln.strip())[0][1:-1] for ln in lines[i:j]]
+        head = [c.strip() for c in block[0]] if block else []
+        cols = [k for k, h in enumerate(head) if _ROW_KEY_COL_RE.search(h)] or [0]
+        for r, parts in enumerate(block[1:], start=1):
+            if all(set(c.strip()) <= set("-: ") for c in parts):
+                continue                    # строка-разделитель шапки
+            for k in cols:
+                if k < len(parts):
+                    out.append((normalize(parts[k]), i + r + 1))
+        i = j
+    return out
+
+
+# вид таблицы — запрос или ответ: по заголовку раздела над таблицей (в raw — «Формат запроса» /
+# «Формат ответа», в карточке — «Правила заполнения исходящего сообщения», «Входные параметры»…).
+# Строка-вставка сопоставляется только с таблицей карточки того же вида (intc-003 КК: вставка
+# clientId в таблицу ОТВЕТА совпала по имени с законной строкой ЗАПРОСА params.filter.clientId)
+_IO_REQ_RE = re.compile(r"запрос|входн\w* парам|исходящ\w* сообщ|request", re.I)
+_IO_RESP_RE = re.compile(r"ответ|выходн\w* парам|исходящ\w* парам|входящ\w* сообщ|response|результат",
+                         re.I)
+
+
+def _io_kind(title: str) -> str:
+    req, resp = bool(_IO_REQ_RE.search(title)), bool(_IO_RESP_RE.search(title))
+    return "запрос" if req and not resp else "ответ" if resp and not req else ""
+
+
+def _token_count(key: str, text: str) -> int:
+    return len(re.findall(r"(?<![\w])" + re.escape(key) + r"(?![\w])", text))
 
 
 def _ins_match(prep: Tuple[List[Fragment], str, str], target_text: str,
@@ -629,10 +708,30 @@ def _ins_match(prep: Tuple[List[Fragment], str, str], target_text: str,
         return rep
     target_norm, starts = _norm_lines(target_text)
     seen: Set[Tuple[str, str]] = set()
+    key_cells: Optional[List[Tuple[str, int]]] = None
     for f in foreign:
         if f.nested and not include_nested:
             rep.nested += 1
             continue
+        if f.kind in _ROW_KINDS and not (_long_enough(f.norm) and f.norm in target_norm):
+            key = _row_key(f)
+            if key and (f.task, "row:" + key) not in seen:
+                seen.add((f.task, "row:" + key))
+                if key_cells is None:
+                    key_cells = _card_key_cells(target_text)
+                hits = [ln for cell, ln in key_cells if _token_count(key, cell)
+                        and not (f.io and _io_kind(_section_at(target_text, ln))
+                                 and _io_kind(_section_at(target_text, ln)) != f.io)]
+                unsure = not f.io or any(not _io_kind(_section_at(target_text, ln)) for ln in hits)
+                # законно — по применённой копии, если она есть: из нормализованного среза raw
+                # строка таблицы вырезается не целиком (ячейки нормализуются иначе, чем страница),
+                # и имя параметра вставки «оставалось» в срезе (КК 2464250512: 2 вхождения)
+                allowed = (_token_count(key, applied_norm) if applied_norm
+                           else _token_count(key, raw_kept))
+                if len(hits) > allowed:
+                    rep.findings.append(Finding(f.task, "row-key", key, len(hits) - allowed,
+                                                hits[0], row=not unsure, row_check=unsure))
+                    continue
         if not _long_enough(f.norm):
             rep.short += 1
             continue
@@ -684,7 +783,8 @@ def check_cards_ins(raw_root: Path, docs: Path, introduced: Set[str],
     docs/traceability-matrix.md, список unapproved — <комплект>/sandbox/confluence-unapproved-jira-pages.md;
     нет файла — столбец «регистрация» пишет «—»/«?»."""
     stats = {"pages": 0, "pages_no_card": 0, "no_copy": 0, "cards": 0, "checked": 0, "short": 0,
-             "nested": 0, "kept": 0, "excluded": 0, "findings": 0, "main": 0, "check": 0, "covered": 0}
+             "nested": 0, "kept": 0, "excluded": 0, "findings": 0, "main": 0, "check": 0, "covered": 0,
+             "rows": 0}
     rows: List[InsRow] = []
     cards = index_cards(docs)
     matrix = matrix or docs / "traceability-matrix.md"
@@ -744,12 +844,14 @@ def check_cards_ins(raw_root: Path, docs: Path, introduced: Set[str],
                 covered, mline, unappr = _registration(f.task, card_id, matrix_lines, unapproved_text)
                 row = InsRow(rel, card_id, pid, f.task, f.norm, f.line, f.count,
                              _section_at(full, f.line),
-                             len(f.norm.split()) <= CHECK_WORDS or len(f.norm) < CHECK_CHARS,
-                             covered, unappr, mline)
+                             f.row_check or len(f.norm.split()) <= CHECK_WORDS
+                             or len(f.norm) < CHECK_CHARS,
+                             covered, unappr, mline, row_key=f.row)
                 rows.append(row)
                 stats["findings"] += 1
                 # покрытое долгом — в свою таблицу, даже если короткое: решение о нём уже принято
-                stats["covered" if covered else "check" if row.check else "main"] += 1
+                stats["covered" if covered else "rows" if row.row_key
+                      else "check" if row.check else "main"] += 1
     stats["cards"] = len(seen_cards)
     return rows, stats
 
@@ -762,14 +864,16 @@ def cards_ins_report(rows: List[InsRow], stats: Dict[str, int]) -> List[str]:
            "дословно (после нормализации) присутствует в карточке-потребителе страницы чаще, чем в "
            "срезе «как должен быть» (архив без удалений введённых задач и без вставок невведённых) и "
            "чем в применённой копии страницы: содержимое невведённой задачи попало в карточку. "
-           "Дополняет ревью, не заменяет: часть фрагмента, переложенная строка таблицы и короткие "
-           "вставки сюда не попадают.", "",
+           "Строка таблицы, переложенная карточкой своей строкой, ловится по имени параметра — "
+           "отдельной рубрикой. Дополняет ревью, не заменяет: часть фрагмента и короткие вставки "
+           "вне строк таблиц сюда не попадают.", "",
            "### Сводка", "",
            f"- страниц архива raw со вставками невведённых задач: {stats['pages']}, из них без "
            f"карточки-потребителя: {stats['pages_no_card']}, без применённой копии (сверка только по "
            f"архиву): {stats['no_copy']}; карточек проверено: {stats['cards']};",
            f"- вставок проверено: {stats['checked']}; находок: {stats['findings']} — основной список "
-           f"{stats['main']}, «проверить» {stats['check']}, покрыто долгом матрицы {stats['covered']};",
+           f"{stats['main']}, «проверить» {stats['check']}, строки таблиц {stats['rows']}, покрыто долгом "
+           f"матрицы {stats['covered']};",
            f"- пропущено: короткие (меньше {MIN_WORDS} слов или {MIN_CHARS} символов) {stats['short']}, "
            f"в ячейках вложенных таблиц {stats['nested']}, законно в срезе или в применённой копии "
            f"{stats['kept']}, только в разделах «Происхождение», «Долги и открытые вопросы» и т. п. "
@@ -805,11 +909,16 @@ def cards_ins_report(rows: List[InsRow], stats: Dict[str, int]) -> List[str]:
     out += table("Основной список",
                  "Находки длиннее порога «проверить», задача не покрыта долгом матрицы с ID этой "
                  "карточки — к исполнителю.",
-                 [r for r in rows if not r.covered and not r.check])
+                 [r for r in rows if not r.covered and not r.check and not r.row_key])
     out += table("Проверить",
                  f"Фрагмент из {CHECK_WORDS} слов или короче {CHECK_CHARS} символов: общая фраза могла "
                  "совпасть случайно, решает человек.",
-                 [r for r in rows if not r.covered and r.check])
+                 [r for r in rows if not r.covered and r.check and not r.row_key])
+    out += table("Строки таблиц невведённых задач",
+                 "Вставка — целиком строка таблицы; карточка переложила её своей строкой: имя "
+                 "параметра (первая ячейка строки, без порога длины) стоит в колонке названия/параметра "
+                 "таблицы карточки чаще, чем в срезе и в применённой копии — к исполнителю.",
+                 [r for r in rows if not r.covered and r.row_key])
     out += table("Покрыто долгом матрицы",
                  "Задача упомянута в строке `docs/traceability-matrix.md` вместе с ID этой карточки — "
                  "долг зарегистрирован; долг без ID карточки не покрывает.",
@@ -870,6 +979,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     a.out.write_text("\n".join(lines) + "\n", encoding="utf-8")
     print(f"удалённое введёнными: находок {stats['findings']} в {stats['cards']} карточках; "
           f"вставки невведённых: основной список {ins_stats['main']} (проверить {ins_stats['check']}, "
+          f"строки таблиц {ins_stats['rows']}, "
           f"покрыто долгом {ins_stats['covered']}; всего {ins_stats['findings']} в "
           f"{len({r.card for r in ins_rows})} карточках); отчёт: {a.out}")
     return 0
