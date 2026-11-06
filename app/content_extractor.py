@@ -879,7 +879,7 @@ class ContentExtractor:
             if marker is not None:
                 task, kind = marker
                 # Вложенность цветов (ТЗ п. 4.5): если внутри есть фрагмент ДРУГОГО цвета —
-                # уплощаем в один маркер под внутренней задачей, а не вкладываем маркеры.
+                # уплощаем в маркеры по прогонам цвета, а не вкладываем маркеры.
                 outer_norm = normalize_color(self._element_own_color(element) or "")
                 # ПЕРВЫМ делом — виден ли собственный цвет элемента хоть на одном
                 # текстовом прогоне (CSS: внутренний цвет перекрывает внешний).
@@ -1300,75 +1300,75 @@ class ContentExtractor:
                         or ("UNKNOWN-" + norm.lstrip("#")))
         return None
 
-    def _collect_flattened_text(self, element: Tag) -> str:
-        """Текст element для уплощения (ТЗ п. 4.5.3, шаг 2).
+    def _flatten_runs(self, element: Tag) -> List[Tuple[str, Optional[str], str]]:
+        """Прогоны вложенной конструкции цветов: (kind, task, текст) в порядке документа
+        (ТЗ п. 4.5.3).
 
-        Отбрасывается только зачёркнутый ЦВЕТНОЙ текст (чужой/черновой — на ПРОМ не был).
-        Зачёркнутый ЧЁРНЫЙ текст (реальное удаление с ПРОМ) НЕ теряется — сохраняется в
-        выводе: молчаливая потеря требования ПРОМ недопустима (приоритет — сохранение текста).
-        Пробелы схлопываются — конструкция инлайновая.
+        Вид и задачу узла определяет его эффективный цвет: цвет правки → вставка задачи
+        этого цвета, зачёркнутый цвет правки → её удаление, как и без вложенности;
+        чёрный/бесцветный, в том числе зачёркнутый, → 'plain', текст ПРОМ без маркера.
+        Соседние узлы одного вида и задачи склеиваются. Узел из одних пробелов прогона не
+        создаёт и задачу не выбирает: спан с цветом вокруг пробела — не правка (КК 05.11:
+        текст требования ушёл под UNKNOWN-ff0000 из-за красного пробела). Пробелы
+        схлопываются — конструкция инлайновая.
         """
-        parts = []
+        runs: List[List] = []
         for text_node in element.find_all(string=True):
-            cur = text_node.parent
-            struck = False
-            color = None
-            while cur is not None and isinstance(cur, Tag):
-                if color is None:
-                    own = self._element_own_color(cur)
-                    if own:
-                        color = own
-                if (cur.name in ("s", "del", "strike")
-                        or "line-through" in (cur.get("style") or "").lower()):
-                    struck = True
-                if cur is element:
-                    break
-                cur = cur.parent
-            # Зачёркнутый ЦВЕТНОЙ (правка) черновик другой задачи → отбросить; зачёркнутый
-            # чёрный/near-black (реальное удаление с ПРОМ) — сохранить (не терять требование).
-            if struck and self._is_edit_color(color):
+            text = str(text_node)
+            if not text.strip():
+                if runs:
+                    runs[-1][2] += text
                 continue
-            parts.append(str(text_node))
-        return re.sub(r"\s+", " ", "".join(parts)).strip()
+            color, struck = self._text_node_style(text_node)
+            if self._is_edit_color(color):
+                norm = normalize_color(color)
+                task = self.config.color_map.get(norm) or ("UNKNOWN-" + norm.lstrip("#"))
+                kind = "del" if struck else "ins"
+            else:
+                task, kind = None, "plain"
+            if runs and runs[-1][0] == kind and runs[-1][1] == task:
+                runs[-1][2] += text
+            else:
+                runs.append([kind, task, text])
+        for run in runs:
+            run[2] = re.sub(r"\s+", " ", run[2])
+        if runs:
+            runs[0][2] = runs[0][2].lstrip()
+            runs[-1][2] = runs[-1][2].rstrip()
+        return [(kind, task, text) for kind, task, text in runs]
 
-    def _flatten_nested_parts(self, element: Tag) -> Tuple[Optional[str], str]:
+    def _flatten_nested_parts(self, element: Tag) -> List[Tuple[str, Optional[str], str]]:
         """Общая часть уплощения вложенной конструкции цветов (ТЗ п. 4.5) для обеих
         нотаций — текстовой (_flatten_nested_critic) и HTML-островов
-        (_flatten_nested_critic_html): запись в отчёт, задача ВНУТРЕННЕГО (самого
-        глубокого = более позднего) цвета и выживший текст без зачёркнутого черновика."""
-        colored = self._critic_colored_descendants(element)
-        # Самый глубокий цвет = внутренняя (поздняя) задача.
-        deepest_norm = max(colored, key=lambda c: c[1])[0] if colored else None
+        (_flatten_nested_critic_html): прогоны и запись в отчёт."""
+        runs = self._flatten_runs(element)
+        run_tasks = {task for _kind, task, _text in runs if task}
         tasks = []
-        for norm, _depth in sorted(colored, key=lambda c: c[1]):
+        for norm, _depth in sorted(self._critic_colored_descendants(element), key=lambda c: c[1]):
             t = self.config.color_map.get(norm) or ("UNKNOWN-" + norm.lstrip("#"))
-            if t not in tasks:
+            if t in run_tasks and t not in tasks:
                 tasks.append(t)
-        inner_task = (self.config.color_map.get(deepest_norm)
-                      or ("UNKNOWN-" + deepest_norm.lstrip("#"))) if deepest_norm else None
 
         # confidence=high: сработал признак структурной вложенности (ТЗ п. 4.5.2, признак 1).
         self._critic_report.append(
-            {"tasks": tasks, "html": str(element), "confidence": "high"})
-
-        return inner_task, self._collect_flattened_text(element)
+            {"tasks": tasks, "html": str(element), "confidence": "high", "parts": len(runs)})
+        return runs
 
     def _flatten_nested_critic(self, element: Tag) -> str:
-        """Уплощает вложенную конструкцию цветов в ОДИН маркер (ТЗ п. 4.5).
+        """Уплощает вложенную конструкцию цветов в последовательность маркеров без
+        вложенности (ТЗ п. 4.5): {++X: a ++}{--Y: b--} {++X: c++}.
 
-        Зачёркнутый черновик отбрасывается; выживший текст оборачивается целиком под
-        идентификатор ВНУТРЕННЕЙ (самой глубокой = более поздней) задачи. Конструкция
-        записывается в отчёт как черновая — требует ручной проверки аналитиком.
+        До 1.9.18 весь текст уходил под один маркер самой глубокой задачи, зачёркнутое
+        отбрасывалось: текст введённой внешней задачи выпадал из среза ПРОМ до ввода
+        внутренней (КК, выгрузка 05.11). Конструкция записывается в отчёт как черновая —
+        требует ручной проверки аналитиком.
         """
-        inner_task, surviving = self._flatten_nested_parts(element)
-        if not surviving or inner_task is None:
-            return ""
-        # Всегда вставка: выживший текст — это новое состояние под поздней задачей.
-        return f"{{++{inner_task}: {surviving}++}}"
+        return "".join(text if kind == "plain" else self._wrap_critic(task, kind, text)
+                       for kind, task, text in self._flatten_nested_parts(element))
 
     def _flatten_nested_critic_html(self, element: Tag) -> str:
-        """То же уплощение в HTML-нотации островов (ТЗ п. 4.7): один
-        <span class="critic-ins"> под внутренней задачей.
+        """То же уплощение в HTML-нотации островов (ТЗ п. 4.7): соседние
+        <span class="critic-ins|critic-del"> по прогонам.
 
         До FB-40 КК (2026-10-28) острова уплощения не знали: внешний элемент получал
         маркер своей задачи, рекурсия шла с непустым стеком, и внутренний цвет другой
@@ -1376,11 +1376,17 @@ class ContentExtractor:
         странице 2166861010 — один critic-ins внешней задачи, черновик внутренней
         уходил в ПРОМ с внешней). Четвёртый дефект семейства «три пути разметки».
         """
-        inner_task, surviving = self._flatten_nested_parts(element)
-        if not surviving or inner_task is None:
-            return ""
-        return (f'<span class="critic-ins" data-task="{inner_task}">'
-                f'{_escape_stray_tag_openers(surviving)}</span>')
+        out = []
+        for kind, task, text in self._flatten_nested_parts(element):
+            text = _escape_stray_tag_openers(text)
+            if kind == "plain":
+                out.append(text)
+                continue
+            # Ведущий пробел — перед маркером, как в _wrap_critic: переживает снятие правки.
+            lead = text[: len(text) - len(text.lstrip(" "))]
+            cls = "critic-ins" if kind == "ins" else "critic-del"
+            out.append(f'{lead}<span class="{cls}" data-task="{task}">{text[len(lead):]}</span>')
+        return "".join(out)
 
     def _cell_uniform_critic(self, cell: Tag):
         """Возвращает (task, kind), если ВЕСЬ видимый текст ячейки окрашен одной задачей.
@@ -2847,7 +2853,7 @@ class ContentExtractor:
                         # задачи, как _split_mixed_strike для текстовых маркеров.
                         norm = normalize_color(self._element_own_color(child) or "")
                         # Вложенный цвет другой задачи (ТЗ п. 4.5) — уплощение, как в прозе
-                        # (_process_element): один маркер под внутренней задачей, запись в
+                        # (_process_element): маркеры по прогонам цвета, запись в
                         # отчёт. Порядок проверок прозы: уплощение раньше смешанного
                         # зачёркивания и частичного перекрытия чёрным (FB-40 КК, 2026-10-28).
                         if self._has_nested_diff_color(child, norm):

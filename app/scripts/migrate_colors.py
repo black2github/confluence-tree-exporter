@@ -22,7 +22,7 @@ import re
 import sys
 from datetime import date
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, Iterable, List, Optional, Tuple
 
 import yaml
 
@@ -49,6 +49,12 @@ def new_accumulator() -> dict:
         "tasks": {},                  # task_id -> {color, confidence, pages:set, markers}
         "color_summary": [],          # список {page, color, count, classification, task} — постранично
         "colored_fragments_total": 0,
+        # Сверка выпущенных маркеров с переписью цветов (1.9.18)
+        "marker_pages": 0,            # страниц, по которым маркеры сверены
+        "markers_total": 0,           # маркеров всего, включая форс-обёртку
+        "markers_forced": 0,          # из них форс-обёртка --unapproved-jira
+        "marker_tasks": set(),        # задачи, у которых есть маркеры
+        "marker_mismatch": [],        # задача есть в маркерах, но не в переписи страницы
     }
 
 
@@ -118,6 +124,63 @@ def accumulate_page(acc: dict, name: str, result, survey: dict) -> None:
             entry["date"] = d
 
 
+def reconcile_page_markers(acc: dict, name: str, result, survey: dict, content: str,
+                           forced_task: Optional[str] = None,
+                           nested_tasks: Iterable[str] = ()) -> None:
+    """Сверяет маркеры итогового markdown страницы с переписью цветов (1.9.18).
+
+    Перепись считает цвета HTML, а apply/reject работают с маркерами. Задача, которая есть
+    в маркерах и которой нет в переписи страницы, добавляется в сводку (`source: markers`)
+    и в манифест; UNKNOWN-* дополнительно попадает в unresolved_placeholders: «UNKNOWN 0»
+    в отчёте обязано значить, что таких маркеров на страницах прогона нет. Текст под UNKNOWN
+    reject-all снимает молча (архив КК 05.11: UNKNOWN-ff0000 при нуле в отчёте).
+
+    forced_task — задача форс-обёртки: в переписи её нет по построению (она метит чёрный
+    текст), поэтому её маркеры идут отдельным числом и расхождением не считаются.
+    """
+    from app.scripts.CI.critic import count_task_markers
+
+    counts = count_task_markers(content)
+    acc["marker_pages"] += 1
+    acc["markers_total"] += sum(counts.values())
+    acc["marker_tasks"].update(counts)
+
+    survey_tasks = {info.get("task") for info in survey.values()}
+    unresolved_colors = {u["color"] for u in result.unresolved_jira}
+    nested = set(nested_tasks)
+    for task, count in counts.items():
+        if task == forced_task:
+            acc["markers_forced"] += count
+            continue
+        if task in survey_tasks:
+            continue
+
+        is_unknown = task.startswith("UNKNOWN-")
+        if is_unknown:
+            color = "#" + task[len("UNKNOWN-"):]
+            reason = ("jira-unresolved" if color in unresolved_colors
+                      else "nested-only" if task in nested else "not-in-history")
+            confidence = "unresolved"
+            acc["unresolved_placeholders"].append({
+                "placeholder": task, "color": color, "page": name, "count": count,
+                "reason": reason, "source": "markers"})
+        else:
+            color = next((c for c, t in result.color_to_task.items() if t == task), "")
+            reason = "nested-only" if task in nested else None
+            confidence = result.confidence.get(color, "high")
+        acc["marker_mismatch"].append({"page": name, "task": task, "color": color,
+                                       "count": count, "reason": reason})
+        acc["color_summary"].append({
+            "page": name, "color": color, "count": count,
+            "classification": "unknown" if is_unknown else "task",
+            "task": task, "delta_e": None, "source": "markers"})
+        entry = acc["tasks"].setdefault(
+            task, {"color": color, "confidence": confidence, "pages": set(),
+                   "markers": 0, "date": None})
+        entry["pages"].add(name)
+        entry["markers"] += count
+
+
 def finalize(acc: dict, service: str, migrated_at: str) -> Tuple[dict, dict]:
     """Строит (manifest, report) из наполненного аккумулятора."""
     manifest_tasks = {}
@@ -147,7 +210,10 @@ def finalize(acc: dict, service: str, migrated_at: str) -> Tuple[dict, dict]:
                  + len(acc["markers_in_code"]) + len(acc["unnamed_status"])
                  + sum(1 for f in acc["auto_page_flag"] if f["kind"] != "поставлен")
                  + len(acc.get("forced_skipped", []))
-                 + len(acc.get("prom_invariant", [])))
+                 + len(acc.get("prom_invariant", []))
+                 # UNKNOWN-* из расхождений уже учтён в unresolved_placeholders
+                 + sum(1 for m in acc["marker_mismatch"]
+                       if not m["task"].startswith("UNKNOWN-")))
     report = {
         "migrated_at": migrated_at,
         "service": service,
@@ -156,6 +222,11 @@ def finalize(acc: dict, service: str, migrated_at: str) -> Tuple[dict, dict]:
             "colored_fragments_total": acc["colored_fragments_total"],
             "positions_manual_review": positions,
             "nested_flattened": len(acc["nested"]),
+            "marker_pages": acc["marker_pages"],
+            "markers_total": acc["markers_total"],
+            "markers_forced": acc["markers_forced"],
+            "marker_tasks": len(acc["marker_tasks"]),
+            "marker_mismatches": len(acc["marker_mismatch"]),
         },
         "pages_without_history": acc["pages_without_history"],
         "unresolved_placeholders": acc["unresolved_placeholders"],
@@ -169,6 +240,7 @@ def finalize(acc: dict, service: str, migrated_at: str) -> Tuple[dict, dict]:
         "forced_skipped": acc.get("forced_skipped", []),
         "prom_invariant": acc.get("prom_invariant", []),
         "nested_flattened": acc["nested"],
+        "marker_mismatch": acc["marker_mismatch"],
         "color_summary": sorted(acc["color_summary"],
                                 key=lambda c: (c["color"], -c["count"], c["page"])),
         "apply_order": apply_order,
@@ -218,10 +290,15 @@ def migrate_pages(pages, service, migrated_at, out_dir):
         extractor = create_critic_extractor(result.color_to_task)
         body = extractor.extract(raw_html)
         body, dropped = postpass_drop_contained_deletions(body)  # ТЗ 4.5.4
-        accumulate_page(acc, name, result, survey_body_colors(raw_html, result))
+        survey = survey_body_colors(raw_html, result)
+        accumulate_page(acc, name, result, survey)
+        reconcile_page_markers(acc, name, result, survey, body,
+                               nested_tasks=(t for rec in extractor._critic_report
+                                             for t in rec["tasks"]))
         for rec in extractor._critic_report:
             acc["nested"].append({"page": name, "tasks": rec["tasks"], "html": rec["html"][:500],
-                                  "confidence": rec.get("confidence", "high")})
+                                  "confidence": rec.get("confidence", "high"),
+                                  **({"parts": rec["parts"]} if "parts" in rec else {})})
         for d in dropped:
             acc["nested"].append({"page": name, "tasks": [d["task"], d["insert_task"]],
                                   "html": d["text"][:500], "confidence": "post-pass"})
@@ -314,6 +391,11 @@ def render_report_md(report: dict) -> str:
     lines.append(f"- Страниц обработано: {st['pages_processed']}")
     lines.append(f"- Цветных фрагментов найдено: {st['colored_fragments_total']}")
     lines.append(f"- Позиций требует ручного разбора: {st['positions_manual_review']}")
+    # Команда report маркеры не выпускает: сверять нечего, строка была бы ложным нулём.
+    if st.get("marker_pages"):
+        lines.append(f"- Маркеров в архиве: {st['markers_total']} по {st['marker_tasks']} "
+                     f"задачам (из них форс-обёртка --unapproved-jira: {st['markers_forced']}), "
+                     f"расхождений с переписью: {st['marker_mismatches']}")
     lines.append("")
 
     def _section(title: str, items: List[str]):
@@ -332,6 +414,13 @@ def render_report_md(report: dict) -> str:
              [f"- `{u['placeholder']}` цвет {to_rgb_notation(u['color']) or ''} "
               f"({u['color']}) на «{u['page']}» ×{u['count']} ({u['reason']})"
               for u in report["unresolved_placeholders"]])
+    # Перепись считает цвета HTML, а apply/reject работают с маркерами: задача из маркеров,
+    # которой перепись не видит, — разметка вышла мимо цвета страницы, нужен разбор.
+    _section("Маркеры задач, которых нет в переписи цветов страницы",
+             [f"- `{m['task']}` на «{m['page']}» ×{m['count']}"
+              + (f" цвет {to_rgb_notation(m['color']) or ''} ({m['color']})" if m["color"] else "")
+              + (f" ({m['reason']})" if m["reason"] else "")
+              for m in report.get("marker_mismatch", [])])
     _section("Коллизии «цвет → несколько задач»",
              [f"- {to_rgb_notation(c['color']) or ''} ({c['color']}) на «{c['page']}»: "
               f"выбран {c['chosen']} из {c['candidates']}" for c in report["collisions"]])
@@ -386,7 +475,6 @@ def render_report_md(report: dict) -> str:
 
     # Сторож --check-prom: слова ПРОМ источника против reject-all / вставки против apply.
     # Непустая секция = разметка страницы отправила текст не в тот маркер — разбор руками
-    # (уплощения ТЗ п. 4.5 тоже сюда попадают: они оборачивают чёрный текст намеренно).
     def _words(items):
         return ", ".join(f"{w}×{n}" if n > 1 else w for w, n in items[:20])
 

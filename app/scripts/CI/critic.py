@@ -1180,21 +1180,32 @@ def collect_task_occurrences(text: str) -> dict:
         return any(s <= pos < e for s, e in code)
 
     occ: dict = {}
+    for task, pos in _iter_task_markers(text):
+        if not in_code(pos):
+            occ.setdefault(task, set()).add(_line_at(text, pos))
+    return {task: sorted(lines) for task, lines in occ.items()}
 
-    def add(task: str, pos: int):
-        if in_code(pos):
-            return
-        occ.setdefault(task, set()).add(_line_at(text, pos))
 
+def _iter_task_markers(text: str):
+    """(task_id, позиция) каждого маркера всех нотаций: inline, status, data-task."""
     for rx in (_INS_RE, _DEL_RE, _SUB_RE):
         for m in rx.finditer(text):
-            add(m.group(1), m.start())
+            yield m.group(1), m.start()
     for m in _STATUS_CELL_RE.finditer(text):
-        add(m.group(1), m.start(1))
+        yield m.group(1), m.start(1)
     for m in _DATA_TASK_RE.finditer(text):
-        add(m.group(1), m.start(1))
+        yield m.group(1), m.start(1)
 
-    return {task: sorted(lines) for task, lines in occ.items()}
+
+def count_task_markers(text: str) -> dict:
+    """{task_id: число маркеров} по всем нотациям. Блоки кода не считаются: apply/reject
+    их не видят, такие маркеры уходят в отдельный раздел отчёта (find_markers_in_code)."""
+    code = [(s, e) for s, e, kind in _region_spans(text) if kind == "code"]
+    counts: dict = {}
+    for task, pos in _iter_task_markers(text):
+        if not any(s <= pos < e for s, e in code):
+            counts[task] = counts.get(task, 0) + 1
+    return counts
 
 
 def _norm_ws(s: str) -> str:

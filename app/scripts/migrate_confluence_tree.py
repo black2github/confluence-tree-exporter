@@ -308,8 +308,14 @@ def _resolve_page_content(page_data: Dict, include_unapproved: bool, critic: boo
                         {"page": name, **prom_chk.as_report()})
 
         if critic_acc is not None:
-            from app.scripts.migrate_colors import accumulate_page
-            accumulate_page(critic_acc, name, result, survey_body_colors(raw, result))
+            from app.scripts.migrate_colors import accumulate_page, reconcile_page_markers
+            survey = survey_body_colors(raw, result)
+            accumulate_page(critic_acc, name, result, survey)
+            # Сверка маркеров итогового markdown с переписью цветов (1.9.18)
+            reconcile_page_markers(critic_acc, name, result, survey, content,
+                                   forced_task=forced.task if forced else None,
+                                   nested_tasks=(t for rec in extractor._critic_report
+                                                 for t in rec["tasks"]))
             for nest in nesting:
                 critic_acc["literal_nesting"].append(
                     {"page": name, "line": nest["line"],
@@ -325,7 +331,8 @@ def _resolve_page_content(page_data: Dict, include_unapproved: bool, critic: boo
             for rec in extractor._critic_report:  # признаки 1 (вложенность) и 2 (примыкание)
                 critic_acc["nested"].append(
                     {"page": name, "tasks": rec["tasks"], "html": rec["html"][:500],
-                     "confidence": rec.get("confidence", "high")})
+                     "confidence": rec.get("confidence", "high"),
+                     **({"parts": rec["parts"]} if "parts" in rec else {})})
             for d in dropped:  # пост-проход: переклассифицировано и отброшено
                 critic_acc["nested"].append(
                     {"page": name, "tasks": [d["task"], d["insert_task"]],
